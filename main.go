@@ -182,7 +182,7 @@ func main() {
 
 	// Did we specify pprof port?
 	var srv *http.Server
-	if pprofPtr != nil {
+	if pprofPtr != nil && *pprofPtr > 0 {
 		srv = &http.Server{
 			Addr: "localhost:" + strconv.Itoa(*pprofPtr),
 		}
