@@ -10,7 +10,7 @@ import (
 )
 
 var _ = Describe("HttpProcessor", func() {
-
+	domain = "domain.io"
 	It("should process when buffer size is larger than body", func() {
 		for _, expectedHeader := range []string{"a.b.com", "tunnel.test.domain.io"} {
 			body := "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 12\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\nBody is here"

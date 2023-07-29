@@ -284,6 +284,12 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 					}
 					go ssh.DiscardRequests(reqs)
 					go func() {
+						defer func() {
+							if r := recover(); r != nil {
+								log.Debugf("Recovered from %s", r)
+							}
+						}()
+
 						defer ch.Close()
 						defer tcpConnection.Close()
 						buf := bufPool.Get().(*[]byte)
@@ -291,6 +297,12 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 						io.CopyBuffer(ch, tcpConnection, *buf)
 					}()
 					go func() {
+						defer func() {
+							if r := recover(); r != nil {
+								log.Debugf("Recovered from %s", r)
+							}
+						}()
+
 						defer ch.Close()
 						defer tcpConnection.Close()
 						buf := bufPool.Get().(*[]byte)
@@ -321,6 +333,13 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 	defer bufPool.Put(httpBuf)
 	defer httpConnection.Close()
 	hadPreviousRequests := false
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Debugf("Recovered from error handling http connection: %s", r)
+		}
+	}()
+
 	for {
 		log.Printf("Waiting for a new http request on TCP connection")
 
@@ -411,9 +430,16 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		wg.Add(2)
 		go ssh.DiscardRequests(reqs)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Debugf("Recovered from %s", r)
+				}
+			}()
+
 			defer wg.Done()
 			buf := bufPool.Get().(*[]byte)
 			defer bufPool.Put(buf)
+
 			n, err := io.CopyBuffer(sshChannel, httpProcessor.GetRequestReader(), *buf)
 			if err != nil {
 				log.Debugf("error copying to SSH channel: %s", err)
@@ -422,6 +448,12 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 
 		}()
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Debugf("Recovered from %s", r)
+				}
+			}()
+
 			defer wg.Done()
 			buf := bufPool.Get().(*[]byte)
 			defer bufPool.Put(buf)
@@ -430,6 +462,7 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 
 			defer sshChannel.Close()
 			// Wrap sshChannel as well to avoid calling .Read multiple times. Otherwise, this will block.
+
 			n, err := io.CopyBuffer(httpConnection, newHttpProcessor(sshChannel, *buf2).GetRequestReader(), *buf)
 			if err != nil {
 				log.Debugf("error copying from SSH channel: %s", err)

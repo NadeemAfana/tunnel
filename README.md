@@ -64,3 +64,19 @@ Creates a TCP tunnel at local port 3001 and remote port 5224.
 tunnel.sh tcp  3001 -p 5224
 ```
 
+For debugging and troubleshooting, append `--debug`
+```
+tunnel.sh 3000 -s abc --debug
+```
+
+
+For more info
+```
+tunnel.sh --help
+```
+
+# Unit Tests
+To run the unit tests
+```
+go test
+```
