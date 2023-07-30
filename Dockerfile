@@ -6,4 +6,4 @@ ENV LANG en_US.utf8
 ADD tunnel /
 
 EXPOSE 80 5223
-CMD ["/tunnel"]
+ENTRYPOINT ["/tunnel", "--domain=mydomain.io"]

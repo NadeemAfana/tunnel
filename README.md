@@ -13,15 +13,8 @@ The tool supports the following features:
 1. It's FREE and has no limitation on its usage.
 
 # Server Setup
-1. Create a `secrets.env` file that contains 2 entries: `authorized_keys.enc` and `ssh_host_key.enc`.
-    1. The `ssh_host_key.enc` entry contains the base64 value of the SSH host-specific private key, which is used to identify the host. You can generate a new key using the command `ssh-keygen -t ecdsa -f /tmp/ssh` to generate the file and then base64 encode it `cat /tmp/ssh | base64 -w 0`.
-    Each client that want to connect must have their public key added to the list. The list of all keys is base64 encoded.
-    1. The `authorized_keys.enc` entry contains a list of all the client public SSH keys separated by a new line.
-    1. A valid `secrets.env` would look like the following
-        ```
-        authorized_keys.enc=c3NoLXJzYSBBQUFBQjNOemFDMXljMkVB=
-        ssh_host_key.enc=LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEU==
-        ```
+1. Create an `ssh_host_key_enc` env variable that contains the base64 value of the SSH host-specific private key which is used to identify the host. You can generate a new key using the command `ssh-keygen -t ecdsa -f /tmp/ssh` to generate the file and then base64 encode it `cat /tmp/ssh | base64 -w 0`.
+1. Create an `authorized_keys_enc` env variable which is the base64 value of the list of all client public SSH keys (each key separated by line feed. The key format is SHA256. See https://tools.ietf.org/html/rfc4648#section-3.2).  Each client that wants to connect must have their public key added to a whitelist list. 
 1. The tunnel requires a **DNS domain** to work. The domain and all subdomains must point to the server for the http tunnel to work. 
 The app will assign a unique subdomain for each HTTP client. For example, if your DNS domain is  `abc.io`, then `x.abc.io` and all subdomains (ie `*.abc.io`) must point to the server.
 1. The following TCP ports must be open on the server
@@ -31,7 +24,14 @@ The app will assign a unique subdomain for each HTTP client. For example, if you
 2. Run the server 
     ```
     go build
-    ./tunnel --domain mydomain.io
+    ./tunnel --domain=mydomain.io
+    ```
+
+    For Docker
+    ```
+     docker build . -t=tunnel
+     docker run -p 80:80 -p 5223:5223 -e authorized_keys_enc='cfhJklQ=' -e ssh_host_key_enc='LS0tCg==' tunnel
+
     ```
 
 ## Client Setup
@@ -42,6 +42,8 @@ First store the DNS in a global variable (You can add this to the shell startup)
 ```
 export TUNNEL_DOMAIN=mydomain.io
 ```
+
+Second, add the client public SSH key to the server `authorized_keys_enc` env variable.
 
 Creates an HTTP tunnel at local port 3000 (`https://username.mydomain.io` points to `http://localhost:3000`):
 ```

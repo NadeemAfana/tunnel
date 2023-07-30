@@ -61,10 +61,8 @@ func main() {
 	}
 	domain = *domainPtr
 
-	err := godotenv.Load("secrets.env")
-	if err != nil {
-		log.Fatalf("An error occured reading secrtets.env: %s", err)
-	}
+	// For local development
+	godotenv.Load("secrets.env")
 
 	log.SetOutput(os.Stdout)
 
@@ -75,8 +73,8 @@ func main() {
 	log.SetLevel(logLevel)
 
 	var authorizedKeysBytes []byte
-	if os.Getenv("authorized_keys.enc") != "" {
-		authorizedKeysBytes, err = base64.StdEncoding.DecodeString(os.Getenv("authorized_keys.enc"))
+	if os.Getenv("authorized_keys_enc") != "" {
+		authorizedKeysBytes, err = base64.StdEncoding.DecodeString(os.Getenv("authorized_keys_enc"))
 	} else {
 		authorizedKeysBytes, err = ioutil.ReadFile("authorized_keys")
 	}
@@ -118,8 +116,8 @@ func main() {
 		},
 	}
 	var privateBytes []byte
-	if os.Getenv("ssh_host_key.enc") != "" {
-		privateBytes, err = base64.StdEncoding.DecodeString(os.Getenv("ssh_host_key.enc"))
+	if os.Getenv("ssh_host_key_enc") != "" {
+		privateBytes, err = base64.StdEncoding.DecodeString(os.Getenv("ssh_host_key_enc"))
 	} else {
 		privateBytes, err = ioutil.ReadFile("ssh_host_key")
 	}
