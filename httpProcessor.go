@@ -21,14 +21,17 @@ type httpProcessor struct {
 	reader                  io.Reader
 	bufReadPos, bufWritePos int   // Buffer Read/write positions
 	totalBytes              int64 // Total bytes Read so far
+	bufferBytesRead         int64 // Bytes read in buffer at the beginning of request
 	bufferUsed              bool  // true if the buffer has been completed Read from
 	parsedHeaders           bool
 	lastError               error
+	request                 bool // Is this a request or response?
 	headers                 map[string][]string
 	URL                     *url.URL
 	bodyStartsIndex         int
 	bodyLength              int64
 	headerBodyReader        io.Reader
+	responseStatusCode      int
 }
 
 func newHttpProcessor(rd io.Reader, buffer []byte) *httpProcessor {
@@ -108,11 +111,13 @@ func (h *httpProcessor) Read(p []byte) (n int, err error) {
 				return n, h.lastError
 			}
 			h.totalBytes += int64(n)
+			h.bufferBytesRead += h.totalBytes
 
 			h.bufWritePos += n
 		}
 
 		if !h.parsedHeaders {
+			h.request = false
 			// Find headers delimiter
 			// Give up if it's not in the buffer.
 			firstLineEndPos := bytes.Index(h.buf, []byte("\r\n"))
@@ -134,12 +139,21 @@ func (h *httpProcessor) Read(p []byte) (n int, err error) {
 				}
 
 				// Assume this is a request, not response to get the URL.
-				if method, requestURI, _, ok := h.parseRequestLine(string(h.buf[0:firstLineEndPos])); ok {
+				line := string(h.buf[0:firstLineEndPos])
+				if method, requestURI, _, ok := h.parseRequestLine(line); ok {
 					if h.validMethod(method) {
 						// This is a request at this point
+						h.request = true
 						if u, err := url.ParseRequestURI(requestURI); err == nil {
 							h.URL = u
 						}
+					}
+				}
+
+				if !h.request {
+					if _, _, responseStatusCode, ok := h.parseResponseLine(line); ok {
+						h.responseStatusCode = responseStatusCode
+						h.request = false
 					}
 				}
 
@@ -189,6 +203,25 @@ func (h *httpProcessor) parseRequestLine(line string) (method, requestURI, proto
 		return "", "", "", false
 	}
 	return method, requestURI, proto, true
+}
+
+func (h *httpProcessor) parseResponseLine(line string) (protocol, status string, statusCode int, ok bool) {
+	protocol, status, ok = strings.Cut(line, " ")
+	if !ok {
+		return "", "", 0, false
+	}
+	statusCodeText, _, _ := strings.Cut(status, " ")
+	if len(statusCodeText) != 3 {
+		// malformed HTTP status code
+		return "", "", 0, false
+	}
+
+	statusCode, err := strconv.Atoi(statusCodeText)
+	if err != nil || statusCode < 0 {
+		// malformed HTTP status code
+		return "", "", 0, false
+	}
+	return protocol, status, statusCode, true
 }
 
 // Upgrade to latest Go and use strings.Cut instead
@@ -242,6 +275,7 @@ func (h *httpProcessor) replaceHeader(headerName string, headerValue string) {
 				headerDiff := len(headerValue) - len(oldHeader[0])
 				h.bufWritePos += headerDiff
 				h.bodyStartsIndex += headerDiff
+				h.bufferBytesRead += int64(headerDiff)
 				h.adjustBodyReader()
 			}
 		}
@@ -293,11 +327,39 @@ func (h *httpProcessor) GetContentLength() (int64, bool) {
 		if err != nil {
 			return 0, false
 		}
+
+		// For 204, 304 and 1xx there is no content in the response body
+		log.Debugf("h.responseStatusCode: %v", h.responseStatusCode)
+		if h.responseStatusCode == 204 || h.responseStatusCode == 304 || (h.responseStatusCode >= 100 && h.responseStatusCode < 200) {
+			return 0, true
+		}
+
+		// Responses to HEAD requests have no content even if content-length has a value, but let's not keep track of request methods
+		// and instead say if the response body is empty in the cache/buffer, assume it's 0.
+		if h.bufferBytesRead-int64(h.bodyStartsIndex) == 0 {
+			return 0, true
+		}
 		return l, true
+
 	}
 
-	// Invalid content-length
-	return 0, true
+	// Missing content-length.
+	log.Debug("Missing Content-Length header")
+	// This can happen when response does not have a "Content-Length" header (nor is chunked)
+
+	// For requests, use what's in the buffer thought we could simply use 0 or error.
+	if h.request {
+		return h.bufferBytesRead - int64(h.bodyStartsIndex), true
+	}
+
+	// For response, if the cached body in buffer is 0, then assume it's 0. This is valid for 304s for example.
+	// if the cached body in buffer is > 0, then keep reading until the response TCP connection closes. This is also a valid scenario.
+	// To mimic the latter, use a very large value 2<<62 - 1 - h.bufferBytesRead
+	if h.bufferBytesRead-int64(h.bodyStartsIndex) > 0 {
+		return 2<<62 - 1 - h.bufferBytesRead, true
+	} else {
+		return 0, true
+	}
 }
 
 func (h *httpProcessor) GetRequestReader() io.Reader {

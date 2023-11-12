@@ -348,9 +348,10 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 
 		// Extract headers to get subdomain
 		host, err := httpProcessor.GetHost()
-		if err != nil && hadPreviousRequests && (err == io.EOF || strings.HasPrefix(err.Error(), ": EOF") ||
+		if err != nil && hadPreviousRequests && (err == io.EOF || strings.HasSuffix(err.Error(), ": EOF") ||
 			strings.Contains(err.Error(), "use of closed network connection")) {
 			// Expected error client only wanted one request
+			log.Printf("Request TCP connection terminated")
 			return
 		}
 		log.Printf("Http request started")
@@ -369,7 +370,7 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 
 			return
 		}
-
+		hadPreviousRequests = true
 		if _, ok := httpProcessor.GetContentLength(); !ok {
 			// Invalid content-length
 			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nInvalid Content-Length header.")
@@ -426,6 +427,8 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 			log.Printf("error opening %s channel: %s", forwardedTCPChannelType, err)
 			return
 		}
+		// Remote http connection underlying TCP socket closed remotely
+		remoteTCPConnectionClose := false
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go ssh.DiscardRequests(reqs)
@@ -462,16 +465,28 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 
 			defer sshChannel.Close()
 			// Wrap sshChannel as well to avoid calling .Read multiple times. Otherwise, this will block.
+			sshChannelWrapper := &eofReader{r: sshChannel}
+			n, err := io.CopyBuffer(httpConnection, newHttpProcessor(sshChannelWrapper, *buf2).GetRequestReader(), *buf)
 
-			n, err := io.CopyBuffer(httpConnection, newHttpProcessor(sshChannel, *buf2).GetRequestReader(), *buf)
 			if err != nil {
 				log.Debugf("error copying from SSH channel: %s", err)
 			}
 			log.Debugf("Copied %v bytes from SSH channel to http response", n)
+			remoteTCPConnectionClose = sshChannelWrapper.EOF
+			if remoteTCPConnectionClose {
+				log.Debugln("remote TCP connection closed")
+			}
+
 		}()
 		wg.Wait()
 
 		log.Printf("Http request ended")
+
+		if remoteTCPConnectionClose {
+			// Do not wait for additional incoming HTTP requests by closing client/incoming TCP connection
+			// since the destination closed their end
+			break
+		}
 		httpProcessor.Close()
 	}
 }

@@ -11,6 +11,71 @@ import (
 
 var _ = Describe("HttpProcessor", func() {
 	domain = "domain.io"
+
+	It("should should read until response TCP connection closes when response is missing content-length", func() {
+		// All response must be read until body reader closes
+		body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\nBody is here"
+		reader := strings.NewReader(body)
+		bufferSize := len(body) * 3
+		buffer := make([]byte, bufferSize)
+		sut := newHttpProcessor(reader, buffer)
+
+		p := make([]byte, len(body))
+		_, err := sut.GetRequestReader().Read(p)
+		Expect(string(p)).To(Equal(body))
+		Expect(err).To(Not(HaveOccurred()))
+	})
+
+	It("should process response when content-length is missing and buffer has no body content in it", func() {
+		body := "HTTP/1.1 304 Not Modified\r\nContent-Type: application/json\r\n\r\n"
+		reader := strings.NewReader(body)
+		bufferSize := len(body) * 3
+		buffer := make([]byte, bufferSize)
+		sut := newHttpProcessor(reader, buffer)
+
+		p := make([]byte, len(body))
+		_, err := sut.GetRequestReader().Read(p)
+		Expect(string(p)).To(Equal(body))
+		Expect(err).To(Not(HaveOccurred()))
+	})
+
+	It("should should not wait for reading response body when content-length > 0 and buffer has no body in it", func() {
+		// Simulates a HEAD request response
+		body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15632\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\n"
+		reader := strings.NewReader(body)
+		bufferSize := len(body) * 3
+		buffer := make([]byte, bufferSize)
+		sut := newHttpProcessor(reader, buffer)
+
+		p := make([]byte, len(body))
+		_, err := sut.GetRequestReader().Read(p)
+		Expect(string(p)).To(Equal(body))
+		Expect(err).To(Not(HaveOccurred()))
+	})
+
+	It("should only process what's in the request buffer when request content-length is missing", func() {
+		for _, expectedHeader := range []string{"a.b.com", "tunnel.test.domain.io"} {
+			body := "POST / HTTP/1.1\r\nContent-Type: application/json\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\nBody is here"
+			oldHeader := "domain.io"
+			reader := strings.NewReader(body)
+			bufferSize := len(body) * 3
+			buffer := make([]byte, bufferSize)
+			sut := newHttpProcessor(reader, buffer)
+			sut.SetHostHeader(expectedHeader)
+			host, err := sut.GetHost()
+			Expect(err).To(Not(HaveOccurred()))
+			Expect(host, expectedHeader)
+
+			origin := sut.headers["Origin"][0]
+			Expect(origin, "https://"+expectedHeader+":123")
+
+			p := make([]byte, len(body)+2*(len(expectedHeader)-len(oldHeader)))
+			_, err = sut.GetRequestReader().Read(p)
+			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, -1)))
+			Expect(err).To(Not(HaveOccurred()))
+		}
+	})
+
 	It("should process when buffer size is larger than body", func() {
 		for _, expectedHeader := range []string{"a.b.com", "tunnel.test.domain.io"} {
 			body := "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 12\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\nBody is here"

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -75,11 +74,9 @@ func main() {
 	var authorizedKeysBytes []byte
 	if os.Getenv("authorized_keys_enc") != "" {
 		authorizedKeysBytes, err = base64.StdEncoding.DecodeString(os.Getenv("authorized_keys_enc"))
-	} else {
-		authorizedKeysBytes, err = ioutil.ReadFile("authorized_keys")
 	}
 	if err != nil {
-		log.Fatalf("Failed to load authorized_keys, err: %v", err)
+		log.Fatalf("Failed to parse authorized_keys_enc env variable, err: %v", err)
 	}
 
 	cancellationCtx, cancelBackground := context.WithCancel(context.Background())
@@ -87,7 +84,7 @@ func main() {
 
 	// Public key authentication is done by comparing
 	// the public key of a received connection
-	// with the entries in the authorized_keys file.
+	// with the entries in the authorized_keys_enc.
 
 	authorizedKeysMap := map[string]bool{}
 	for len(authorizedKeysBytes) > 0 {
@@ -118,8 +115,6 @@ func main() {
 	var privateBytes []byte
 	if os.Getenv("ssh_host_key_enc") != "" {
 		privateBytes, err = base64.StdEncoding.DecodeString(os.Getenv("ssh_host_key_enc"))
-	} else {
-		privateBytes, err = ioutil.ReadFile("ssh_host_key")
 	}
 	if err != nil {
 		log.Fatal("Failed to load private key: ", err)
