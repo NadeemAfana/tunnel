@@ -23,7 +23,7 @@ The app will assign a unique subdomain for each HTTP client. For example, if you
     1. Any additional ports opened at runtime for the TCP tunnel(s).   
 2. Run the server 
     ```
-    go build
+    CGO_ENABLED=0 go build
     ./tunnel --domain=mydomain.io
     ```
 

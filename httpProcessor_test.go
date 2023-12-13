@@ -21,12 +21,12 @@ var _ = Describe("HttpProcessor", func() {
 		sut := newHttpProcessor(reader, buffer)
 
 		p := make([]byte, len(body))
-		_, err := sut.GetRequestReader().Read(p)
+		_, err := sut.GetReader().Read(p)
 		Expect(string(p)).To(Equal(body))
 		Expect(err).To(Not(HaveOccurred()))
 	})
 
-	It("should process response when content-length is missing and buffer has no body content in it", func() {
+	It("should process response when content-length is missing for 304", func() {
 		body := "HTTP/1.1 304 Not Modified\r\nContent-Type: application/json\r\n\r\n"
 		reader := strings.NewReader(body)
 		bufferSize := len(body) * 3
@@ -34,26 +34,98 @@ var _ = Describe("HttpProcessor", func() {
 		sut := newHttpProcessor(reader, buffer)
 
 		p := make([]byte, len(body))
-		_, err := sut.GetRequestReader().Read(p)
+		_, err := sut.GetReader().Read(p)
 		Expect(string(p)).To(Equal(body))
 		Expect(err).To(Not(HaveOccurred()))
+		length, ok := sut.GetContentLength()
+		Expect(length).To(BeZero())
+		Expect(ok).To(BeTrue())
 	})
 
-	It("should should not wait for reading response body when content-length > 0 and buffer has no body in it", func() {
-		// Simulates a HEAD request response
-		body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15632\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\n"
+	It("should process response when content-length is missing for 1xx", func() {
+		body := "HTTP/1.1 180 Not Modified\r\nContent-Type: application/json\r\n\r\n"
 		reader := strings.NewReader(body)
 		bufferSize := len(body) * 3
 		buffer := make([]byte, bufferSize)
 		sut := newHttpProcessor(reader, buffer)
 
 		p := make([]byte, len(body))
-		_, err := sut.GetRequestReader().Read(p)
+		_, err := sut.GetReader().Read(p)
+		Expect(string(p)).To(Equal(body))
+		Expect(err).To(Not(HaveOccurred()))
+		length, ok := sut.GetContentLength()
+		Expect(length).To(BeZero())
+		Expect(ok).To(BeTrue())
+	})
+
+	It("should process response when content-length is missing for 204", func() {
+		body := "HTTP/1.1 204 Not Modified\r\nContent-Type: application/json\r\n\r\n"
+		reader := strings.NewReader(body)
+		bufferSize := len(body) * 3
+		buffer := make([]byte, bufferSize)
+		sut := newHttpProcessor(reader, buffer)
+
+		p := make([]byte, len(body))
+		_, err := sut.GetReader().Read(p)
+		Expect(string(p)).To(Equal(body))
+		Expect(err).To(Not(HaveOccurred()))
+		length, ok := sut.GetContentLength()
+		Expect(length).To(BeZero())
+		Expect(ok).To(BeTrue())
+	})
+
+	It("should return content length of 0 when response HTTP content-length header > 0 and request type is HEAD", func() {
+		// Simulates a HEAD request response
+		body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15632\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\n"
+		reader := strings.NewReader(body)
+		bufferSize := len(body) * 3
+		buffer := make([]byte, bufferSize)
+		sut := newHttpProcessor(reader, buffer)
+		sut.requestMethod = "HEAD"
+		p := make([]byte, len(body))
+		_, err := sut.GetReader().Read(p)
+		length, ok := sut.GetContentLength()
+		Expect(length).To(BeZero())
+		Expect(ok).To(BeTrue())
 		Expect(string(p)).To(Equal(body))
 		Expect(err).To(Not(HaveOccurred()))
 	})
 
-	It("should only process what's in the request buffer when request content-length is missing", func() {
+	It("should return content length of 0 when response HTTP content-length header > 0 and status 2xx and request type is CONNECT", func() {
+		// Simulates a CONNECT request response
+		body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15632\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\n"
+		reader := strings.NewReader(body)
+		bufferSize := len(body) * 3
+		buffer := make([]byte, bufferSize)
+		sut := newHttpProcessor(reader, buffer)
+		sut.requestMethod = "CONNECT"
+		p := make([]byte, len(body))
+		_, err := sut.GetReader().Read(p)
+		length, ok := sut.GetContentLength()
+		Expect(length).To(BeZero())
+		Expect(ok).To(BeTrue())
+		Expect(string(p)).To(Equal(body))
+		Expect(err).To(Not(HaveOccurred()))
+	})
+
+	It("should return correct content length when response HTTP content-length header > 0 and status not 2xx and request type is CONNECT", func() {
+		// Simulates a  CONNECT request response
+		body := "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 15632\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\n"
+		reader := strings.NewReader(body)
+		bufferSize := len(body) * 3
+		buffer := make([]byte, bufferSize)
+		sut := newHttpProcessor(reader, buffer)
+		sut.requestMethod = "CONNECT"
+		p := make([]byte, len(body))
+		_, err := sut.GetReader().Read(p)
+		length, ok := sut.GetContentLength()
+		Expect(length).To(Equal(int64(15632)))
+		Expect(ok).To(BeTrue())
+		Expect(string(p)).To(Equal(body))
+		Expect(err).To(Not(HaveOccurred()))
+	})
+
+	It("should only read what's in the request buffer when request content-length is missing", func() {
 		for _, expectedHeader := range []string{"a.b.com", "tunnel.test.domain.io"} {
 			body := "POST / HTTP/1.1\r\nContent-Type: application/json\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\nBody is here"
 			oldHeader := "domain.io"
@@ -70,7 +142,7 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(origin, "https://"+expectedHeader+":123")
 
 			p := make([]byte, len(body)+2*(len(expectedHeader)-len(oldHeader)))
-			_, err = sut.GetRequestReader().Read(p)
+			_, err = sut.GetReader().Read(p)
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, -1)))
 			Expect(err).To(Not(HaveOccurred()))
 		}
@@ -93,7 +165,7 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(origin, "https://"+expectedHeader+":123")
 
 			p := make([]byte, len(body)+2*(len(expectedHeader)-len(oldHeader)))
-			_, err = sut.GetRequestReader().Read(p)
+			_, err = sut.GetReader().Read(p)
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, -1)))
 			Expect(err).To(Not(HaveOccurred()))
 		}
@@ -113,7 +185,7 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(host, expectedHeader)
 
 			p := make([]byte, len(body)+len(expectedHeader)-len(oldHeader))
-			_, err = io.ReadFull(sut.GetRequestReader(), p)
+			_, err = io.ReadFull(sut.GetReader(), p)
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(err).To(Not(HaveOccurred()))
 		}
@@ -131,7 +203,7 @@ var _ = Describe("HttpProcessor", func() {
 			sut.SetHostHeader(expectedHeader)
 
 			p := make([]byte, len(body)+len(expectedHeader)-len(oldHeader))
-			_, err := io.ReadFull(sut.GetRequestReader(), p)
+			_, err := io.ReadFull(sut.GetReader(), p)
 			Expect(err).To(Not(HaveOccurred()))
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
@@ -151,7 +223,7 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
 
 			p := make([]byte, len(body)+len(expectedHeader)-len(oldHeader))
-			_, err := io.ReadFull(sut.GetRequestReader(), p)
+			_, err := io.ReadFull(sut.GetReader(), p)
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(err).To(Not(HaveOccurred()))
 		}
@@ -169,7 +241,7 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(sut.GetHost()).To(Equal(oldHeader))
 			sut.SetHostHeader(expectedHeader)
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
-			_, err := io.ReadAtLeast(sut.GetRequestReader(), p, len(body)+len(expectedHeader)-len(oldHeader))
+			_, err := io.ReadAtLeast(sut.GetReader(), p, len(body)+len(expectedHeader)-len(oldHeader))
 			Expect(string(p[:len(p)-50])).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(err).To(Not(HaveOccurred()))
 		}
@@ -187,17 +259,17 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(sut.GetHost()).To(Equal(oldHeader))
 			sut.SetHostHeader(expectedHeader)
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
-			n, err := sut.GetRequestReader().Read(p[:130])
+			n, err := sut.GetReader().Read(p[:130])
 			c := n
 			Expect(c).To(BeNumerically(">", 0))
 			Expect(c).To(BeNumerically("<=", 130))
 			Expect(err).To(Not(HaveOccurred()))
-			n, err = sut.GetRequestReader().Read(p[c:200])
+			n, err = sut.GetReader().Read(p[c:200])
 			c += n
 			Expect(c).To(BeNumerically(">", 0))
 			Expect(c).To(BeNumerically("<=", 200))
 			Expect(err).To(Not(HaveOccurred()))
-			n, err = sut.GetRequestReader().Read(p[c:])
+			n, err = sut.GetReader().Read(p[c:])
 			Expect(n).To(BeNumerically(">", 0))
 			c += n
 			Expect(err).To(Not(HaveOccurred()))
@@ -217,7 +289,7 @@ var _ = Describe("HttpProcessor", func() {
 			sut.SetHostHeader(expectedHeader)
 
 			p := make([]byte, len(body)+len(expectedHeader)-len(oldHeader))
-			_, err := sut.GetRequestReader().Read(p)
+			_, err := sut.GetReader().Read(p)
 			Expect(err).To(Not(HaveOccurred()))
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
@@ -237,7 +309,7 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
 
 			p := make([]byte, len(body)+len(expectedHeader)-len(oldHeader))
-			_, err := io.ReadFull(sut.GetRequestReader(), p)
+			_, err := io.ReadFull(sut.GetReader(), p)
 
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(err).To(Not(HaveOccurred()))
@@ -256,7 +328,7 @@ var _ = Describe("HttpProcessor", func() {
 			Expect(sut.GetHost()).To(Equal(oldHeader))
 			sut.SetHostHeader(expectedHeader)
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
-			_, err := sut.GetRequestReader().Read(p)
+			_, err := sut.GetReader().Read(p)
 			Expect(string(p[:len(p)-50])).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(err).To(Not(HaveOccurred()))
 		}
@@ -273,9 +345,9 @@ var _ = Describe("HttpProcessor", func() {
 			sut.SetHostHeader(expectedHeader)
 
 			p := make([]byte, len(body)+len(expectedHeader)-len(oldHeader))
-			_, err := sut.GetRequestReader().Read(p[:len(p)-10])
+			_, err := sut.GetReader().Read(p[:len(p)-10])
 			Expect(err).To(Not(HaveOccurred()))
-			_, err = sut.GetRequestReader().Read(p[len(p)-10:])
+			_, err = sut.GetReader().Read(p[len(p)-10:])
 			Expect(err).To(Not(HaveOccurred()))
 			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, 1)))
 			Expect(sut.GetHost()).To(Equal(expectedHeader))
@@ -290,9 +362,9 @@ var _ = Describe("HttpProcessor", func() {
 		buffer := make([]byte, bufferSize)
 		sut := newHttpProcessor(reader, buffer)
 		p := make([]byte, len(body))
-		_, err := io.ReadFull(sut.GetRequestReader(), p[:len(p)-10])
+		_, err := io.ReadFull(sut.GetReader(), p[:len(p)-10])
 		Expect(err).To(Not(HaveOccurred()))
-		_, err = io.ReadFull(sut.GetRequestReader(), p[len(p)-10:])
+		_, err = io.ReadFull(sut.GetReader(), p[len(p)-10:])
 		Expect(err).To(Not(HaveOccurred()))
 		Expect(string(p)).To(Equal(body))
 		Expect(sut.GetHost()).To(Equal(header))
@@ -326,13 +398,13 @@ var _ = Describe("HttpProcessor", func() {
 		Expect(host).To(Equal(""))
 
 		p := make([]byte, len(body))
-		_, err = sut.GetRequestReader().Read(p[:len(p)-10])
+		_, err = sut.GetReader().Read(p[:len(p)-10])
 		Expect(err).To(Not(HaveOccurred()))
-		_, err = sut.GetRequestReader().Read(p[len(p)-10:])
+		_, err = sut.GetReader().Read(p[len(p)-10:])
 		Expect(err).To(Not(HaveOccurred()))
 		// Expect(err).To(Or(Not(HaveOccurred()), BeEquivalentTo(io.EOF)))
 		Expect(string(p)).To(Equal(body))
-		n, err := sut.GetRequestReader().Read(p[len(p)-10:])
+		n, err := sut.GetReader().Read(p[len(p)-10:])
 
 		// Subsequent call should return error io.EOF with 0 bytes Read
 		Expect(n).To(Equal(0))

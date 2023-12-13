@@ -26,12 +26,16 @@ type httpProcessor struct {
 	parsedHeaders           bool
 	lastError               error
 	request                 bool // Is this a request or response?
-	headers                 map[string][]string
-	URL                     *url.URL
-	bodyStartsIndex         int
-	bodyLength              int64
-	headerBodyReader        io.Reader
-	responseStatusCode      int
+
+	// Http request requestMethod. When this wraps a response, we need to know the accoisated request http requestMethod.
+	// This will be passed in.
+	requestMethod      string
+	headers            map[string][]string
+	URL                *url.URL
+	bodyStartsIndex    int
+	bodyLength         int64
+	headerBodyReader   io.Reader
+	responseStatusCode int
 }
 
 func newHttpProcessor(rd io.Reader, buffer []byte) *httpProcessor {
@@ -144,6 +148,7 @@ func (h *httpProcessor) Read(p []byte) (n int, err error) {
 					if h.validMethod(method) {
 						// This is a request at this point
 						h.request = true
+						h.requestMethod = method
 						if u, err := url.ParseRequestURI(requestURI); err == nil {
 							h.URL = u
 						}
@@ -327,16 +332,18 @@ func (h *httpProcessor) GetContentLength() (int64, bool) {
 		if err != nil {
 			return 0, false
 		}
-
+		// See https://www.rfc-editor.org/rfc/rfc9110.html
 		// For 204, 304 and 1xx there is no content in the response body
 		log.Debugf("h.responseStatusCode: %v", h.responseStatusCode)
 		if h.responseStatusCode == 204 || h.responseStatusCode == 304 || (h.responseStatusCode >= 100 && h.responseStatusCode < 200) {
 			return 0, true
 		}
 
-		// Responses to HEAD requests have no content even if content-length has a value, but let's not keep track of request methods
-		// and instead say if the response body is empty in the cache/buffer, assume it's 0.
-		if h.bufferBytesRead-int64(h.bodyStartsIndex) == 0 {
+		// Responses to HEAD and CONNECT requests have no content even if content-length has a value.
+		if !h.request && h.requestMethod == "CONNECT" && (h.responseStatusCode >= 200 && h.responseStatusCode < 300) {
+			return 0, true
+		}
+		if !h.request && h.requestMethod == "HEAD" {
 			return 0, true
 		}
 		return l, true
@@ -362,7 +369,7 @@ func (h *httpProcessor) GetContentLength() (int64, bool) {
 	}
 }
 
-func (h *httpProcessor) GetRequestReader() io.Reader {
+func (h *httpProcessor) GetReader() io.Reader {
 	h.ReadHeadersIfNeeded()
 	return h.headerBodyReader
 }

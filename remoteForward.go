@@ -443,7 +443,7 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 			buf := bufPool.Get().(*[]byte)
 			defer bufPool.Put(buf)
 
-			n, err := io.CopyBuffer(sshChannel, httpProcessor.GetRequestReader(), *buf)
+			n, err := io.CopyBuffer(sshChannel, httpProcessor.GetReader(), *buf)
 			if err != nil {
 				log.Debugf("error copying to SSH channel: %s", err)
 			}
@@ -466,8 +466,9 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 			defer sshChannel.Close()
 			// Wrap sshChannel as well to avoid calling .Read multiple times. Otherwise, this will block.
 			sshChannelWrapper := &eofReader{r: sshChannel}
-			n, err := io.CopyBuffer(httpConnection, newHttpProcessor(sshChannelWrapper, *buf2).GetRequestReader(), *buf)
-
+			responseHttpProcessor := newHttpProcessor(sshChannelWrapper, *buf2)
+			responseHttpProcessor.requestMethod = httpProcessor.requestMethod
+			n, err := io.CopyBuffer(httpConnection, responseHttpProcessor.GetReader(), *buf)
 			if err != nil {
 				log.Debugf("error copying from SSH channel: %s", err)
 			}
