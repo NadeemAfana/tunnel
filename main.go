@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -21,7 +22,12 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var domain string
+// DNS domainURL. This might include a path but only when domainPath is true.
+var domainURL string
+var domainURI url.URL
+
+// Indicates a url path (ie not subdomain) setup.
+var domainPath bool
 
 const sshPort = 5223
 const clientKeepaliveInterval = 5 * time.Second
@@ -43,22 +49,35 @@ func init() {
 
 func main() {
 
-	// --domain="domain.io"
-	domainPtr := flag.String("domain", "", "DNS domain (eg domain.io) that points to this server.")
+	// --domainUrl="domain.io"
+	domainPtr := flag.String("domainUrl", "", "DNS domain URL (eg domain.io) that points to this server.")
+
+	// --domainPath=true or --domainPath
+	domainPathPtr := flag.Bool("domainPath", false, "Instead opf subdomains, use a URL query path for user tunnels.")
 
 	// --log=info
 	logPtr := flag.String("log", "info", "Log level: debug, info, warn, or error.")
 
 	// --pprof=6060
 	// Spin up pprof endpoints at port 6060
-	pprofPtr := flag.Int("pprof", 0, "poprt number to spin up pprof endpoints for. Useful for debugging and troubleshooting.")
+	pprofPtr := flag.Int("pprof", 0, "port number to spin up pprof endpoints for. Useful for debugging and troubleshooting.")
 
 	flag.Parse()
 
 	if domainPtr == nil || *domainPtr == "" {
 		log.Fatalln("DNS domain is empty.")
 	}
-	domain = *domainPtr
+	domainURL = *domainPtr
+
+	uriPtr, err := url.Parse(domainURL)
+	if err != nil {
+		log.Fatalf("An error occured parsing domainURL: %s", err)
+	}
+	domainURI = *uriPtr
+
+	if domainPathPtr != nil {
+		domainPath = *domainPathPtr
+	}
 
 	// For local development
 	godotenv.Load("secrets.env")
@@ -231,7 +250,7 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 	defer close(execRequestCompleted)
 	defer func() {
 		// Clean up subdomain cache
-		subdomain := serverConnection.GetSubDomain()
+		subdomain := serverConnection.GetTunnelName()
 		if subdomain != nil {
 			forwardRequest := serverConnection.GetRequestForwardPayload()
 			if forwardRequest != nil {

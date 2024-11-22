@@ -30,6 +30,7 @@ type httpProcessor struct {
 	// Http request requestMethod. When this wraps a response, we need to know the accoisated request http requestMethod.
 	// This will be passed in.
 	requestMethod      string
+	requestRawURI      string
 	headers            map[string][]string
 	URL                *url.URL
 	bodyStartsIndex    int
@@ -93,6 +94,20 @@ func (h *httpProcessor) GetHost() (string, error) {
 	return "", errors.New("could not find Host header")
 }
 
+func (h *httpProcessor) GetURLPath() (string, error) {
+	err := h.ReadHeadersIfNeeded()
+	if err != nil {
+		return "", err
+	}
+
+	// TODO: Add unit test
+	if h.URL != nil {
+		path := h.URL.Path
+		return path, nil
+	}
+	return "", errors.New("could not find URL path")
+}
+
 // Read reads data into p replacing the header if found.
 // It returns the number of bytes written into p.
 // It is important to only call reader.Read at most once since this can cause blocking.
@@ -149,6 +164,7 @@ func (h *httpProcessor) Read(p []byte) (n int, err error) {
 						// This is a request at this point
 						h.request = true
 						h.requestMethod = method
+						h.requestRawURI = requestURI
 						if u, err := url.ParseRequestURI(requestURI); err == nil {
 							h.URL = u
 						}
@@ -287,6 +303,42 @@ func (h *httpProcessor) replaceHeader(headerName string, headerValue string) {
 	}
 }
 
+func (h *httpProcessor) replaceHttpRequestURL(newURL string) {
+	h.ReadHeadersIfNeeded()
+
+	if h.URL != nil && h.request {
+
+		// Assume newURL is valid
+		var err error
+		h.URL, err = url.Parse(newURL)
+		if err != nil {
+			return
+		}
+
+		// Update internal buffer if it has not been used
+		if !h.bufferUsed {
+			start := bytes.Index(h.buf, []byte(h.requestRawURI))
+			if start < 0 {
+				return
+			}
+			end := bytes.Index(h.buf[start:], []byte("\n"))
+			if end < 0 {
+				return
+			}
+			end += start
+			temp := h.buf[start:end]
+			tempFixed := bytes.Replace(temp, []byte(h.requestRawURI), []byte(newURL), 1)
+			h.buf = bytes.Replace(h.buf, temp, tempFixed, 1)
+			diff := len(newURL) - len(h.requestRawURI)
+			h.bufWritePos += diff
+			h.bodyStartsIndex += diff
+			h.bufferBytesRead += int64(diff)
+			h.adjustBodyReader()
+			h.requestRawURI = newURL
+		}
+	}
+}
+
 // SetHostHeader replaces host and origin headers if any
 func (h *httpProcessor) SetHostHeader(header string) {
 	h.ReadHeadersIfNeeded()
@@ -296,8 +348,13 @@ func (h *httpProcessor) SetHostHeader(header string) {
 	// Replace origin only if its value matches the proxy domain
 	if h.headers != nil {
 		if oldHeader, ok := h.headers["Origin"]; ok && len(oldHeader) == 1 {
-			if strings.Contains(strings.ToLower(oldHeader[0]), strings.ToLower(domain)) {
-				h.replaceHeader("Origin", strings.Replace(oldHeader[0], domain, header, 1))
+			domainEndIndex := strings.Index(domainURL, "/")
+			if domainEndIndex == -1 {
+				domainEndIndex = len(domainURL)
+			}
+
+			if strings.Contains(strings.ToLower(oldHeader[0]), strings.ToLower(domainURL[:domainEndIndex])) {
+				h.replaceHeader("Origin", strings.Replace(oldHeader[0], domainURL[:domainEndIndex], header, 1))
 			}
 		}
 	}

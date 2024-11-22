@@ -10,7 +10,7 @@ import (
 )
 
 var _ = Describe("HttpProcessor", func() {
-	domain = "domain.io"
+	domainURL = "domain.io"
 
 	It("should should read until response TCP connection closes when response is missing content-length", func() {
 		// All response must be read until body reader closes

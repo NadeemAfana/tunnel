@@ -4,12 +4,12 @@
 # NOTES:
 # The script re-launches ssh when it dies to reconnect automatically.
 # It uses an unbuffered pipe to keep the output on screen.
-# The SSH server takes the following arguments in the format key=value separated by a comma (eg subdomain=abc,id=19417814394)
+# The SSH server takes the following arguments in the format key=value separated by a comma (eg tunnelName=abc,id=19417814394)
 # The values are:
-#           subdomain:  Optional. The name of the subdomain to use if available. If not specified, the server will use a random name. (HTTP only)
+#           tunnelName: Optional. The tunnel Name (eg subdomain) to use if available. If not specified, the server will use a random name. (HTTP only)
 #           header:     Optional. Overrides the HOST header name when executing the HTTP request (HTTP only)
-#           id:         Optional. Random string to identify the client session. This is useful for reclaiming the subdomain in case of transient
-#                       network errors. Otherwise, when the SSH client reconnects, it will use a different subdomain.
+#           id:         Optional. Random string to identify the client session. This is useful for reclaiming the tunnelName in case of transient
+#                       network errors. Otherwise, when the SSH client reconnects, it will use a different tunnelName.
 
 # Adjust the following values to match the server's
 sshPort=5223              # server's SSH listening port
@@ -20,12 +20,12 @@ serverTcpBindingPort=0    # server's local binding port that listens for incomin
 printHelp () {
   printf "Creates a TCP or HTTP tunnel between this machine and remote $TUNNEL_DOMAIN\n"
   printf "Usage:\n"
-  printf "  tunnel.sh [http/tcp] [LOCAL_PORT] [-s|--subdomain NAME] [-k, --key FILE]\n"
+  printf "  tunnel.sh [http/tcp] [LOCAL_PORT] [-n|--tunnelName NAME] [-k, --key FILE]\n"
   printf "            [-p, --remote-port PORT]  [-h|--host HOST] [--debug]\n\n"
   printf "  %-28s Creates an HTTP tunnel at default local port 3000 with\n" "tunnel.sh"
-  printf "  %-28s subdomain named after the current user.\n\n"
+  printf "  %-28s tunnelName named after the current user.\n\n"
   printf "  %-28s Creates an HTTP tunnel for forward host example.com at port 3000.\n\n" "tunnel.sh example.com:3000"
-  printf "  %-28s Creates an HTTP tunnel at local port 3000 at subdomain 'abc'.\n\n" "tunnel.sh 3000 -s abc"
+  printf "  %-28s Creates an HTTP tunnel at local port 3000 with tunnelName 'abc'.\n\n" "tunnel.sh 3000 -n abc"
   printf "  %-28s Creates a TCP tunnel at local port 3001 and remote port 5224.\n\n" "tunnel.sh tcp  3001 -p 5224"
   printf '\nArguments\n'
   printf "  %-25s Uses an HTTP tunnel.\n"  "http, --http"
@@ -37,15 +37,15 @@ printHelp () {
   printf "  %-25s Selects a file from which the identity (private key) for public key authentication is read.\n"  "-k, --key FILE"
   printf "  %-25s This is passed using -i to SSH.\n"
   
-  printf "  %-25s Specifies the name of the HTTP subdomain to take.\n"  "-s, --subdomain SUBDOMAIN"
-  printf "  %-25s Use this if you expect to keep the same subdomain after network disconnects.\n"
+  printf "  %-25s Specifies the name of the HTTP tunnelName to take.\n"  "-n, --tunnelName NAME"
+  printf "  %-25s Use this if you expect to keep the same tunnelName after network disconnects.\n"
   printf "  %-25s Overrides the HOST header with the specified value.\n"  "-h, --host HOST"
   printf "  %-25s Uses the specified PORT to listen at on the server side. Defaults to 80 for HTTP.\n"  "-p, --remote-port PORT"
 
   printf "  %-25s Display this help and exit\n"  "-help, --help"
 }
 
-subdomain="$USER"     # default subdomain is the name of the current user
+tunnelName="$USER"     # default tunnelName is the name of the current user
 localHostPort="localhost:3000"      # default local  (host) and http/tcp port
 remotePort=$serverHttpBindingPort # remote port specified by client
 type="http"           # default tunnel type is HTTP
@@ -55,8 +55,8 @@ key=""
 # Parse arguments
 while [ "$1" != "" ]; do
     case $1 in
-        -s | --subdomain)       shift
-                                subdomain=$1
+        -n | --tunnelName)      shift
+                                tunnelName=$1
                                 ;;
         -h | --host)            shift
                                 overrideHeaderHost=$1
@@ -130,8 +130,8 @@ fi
 
 
 
-# Default arguments to pass to SSH server. The default subdomain is the current user name. Override the host header with 'localhost'
-sshServerArgs="subdomain=$subdomain,header=$overrideHeaderHost,id=`cat /proc/sys/kernel/random/uuid`"
+# Default arguments to pass to SSH server. The default tunnelName is the current user name. Override the host header with 'localhost'
+sshServerArgs="tunnelName=$tunnelName,header=$overrideHeaderHost,id=`cat /proc/sys/kernel/random/uuid`"
 
 # Extra args to pass to SSH cli
 sshCliArgs=" -o ConnectionAttempts=$((10**4))  -o ServerAliveInterval=20 -o ServerAliveCountMax=2"
@@ -152,7 +152,7 @@ if [[ "$debug" = true ]]; then
   printf "  %-25s $localHostPort\n"  "localHostPort"
   printf "  %-25s $remotePort\n"  "remotePort"
   printf "  %-25s $TUNNEL_DOMAIN\n"  "domain"
-  printf "  %-25s $subdomain\n"  "subdomain"
+  printf "  %-25s $tunnelName\n"  "tunnelName"
   printf "  %-25s $sshPort\n"  "sshPort"
   printf "  %-25s $serverHttpBindingPort\n"  "serverHttpBindingPort"
   printf "  %-25s $serverTcpBindingPort\n"  "serverTcpBindingPort"
@@ -189,8 +189,9 @@ child=$!
 # print the tunneling http URLs.
 stdbuf -oL head $fifo -n $((10**10)) | grep --line-buffered '.*' |
   while IFS= read -r LINE0
-  do
-    if echo "${LINE0}" | grep -Pq "(http[s]?://.*${TUNNEL_DOMAIN}$|${TUNNEL_DOMAIN}:\d+$)"; then
+  do    
+    if echo "${LINE0}" | grep -Pq "^(http[s]?://.*${TUNNEL_DOMAIN}|${TUNNEL_DOMAIN}:\d+)"; then
+          # The first line is always the full tunnel http URL
           s="$localHostPort"
           printf "Tunneling %s -> $s\n" "${LINE0}"
       else

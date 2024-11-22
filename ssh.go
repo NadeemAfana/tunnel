@@ -10,7 +10,7 @@ import (
 type sshConnection struct {
 	*ssh.ServerConn
 	*sync.Mutex
-	subdomain       *string
+	tunnelName      *string
 	reqPayload      *remoteForwardRequest
 	sshChannel      *ssh.Channel
 	cancellationCtx context.Context
@@ -28,16 +28,16 @@ func (c *sshConnection) GetRequestForwardPayload() *remoteForwardRequest {
 	return c.reqPayload
 }
 
-func (c *sshConnection) SetSubDomain(s string) {
+func (c *sshConnection) SetTunnelName(s string) {
 	c.Lock()
 	defer c.Unlock()
-	c.subdomain = &s
+	c.tunnelName = &s
 }
 
-func (c *sshConnection) GetSubDomain() *string {
+func (c *sshConnection) GetTunnelName() *string {
 	c.Lock()
 	defer c.Unlock()
-	return c.subdomain
+	return c.tunnelName
 }
 
 func (c *sshConnection) GetSessionChannel() *ssh.Channel {

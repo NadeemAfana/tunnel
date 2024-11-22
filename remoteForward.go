@@ -47,28 +47,29 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	// Cache channel for communication with client upon receiving HTTP requests
 	conn.SetSessionChannel(&session.channel)
 
-	// For retaining the same subdomain name in case of an SHH client interruption,
-	// Firstly, the subdomain must not be taken.
-	// The client must send its subdomain name via a channel along with an id (id=dhskjdshf24343,subdomain=tunnel)
+	// For retaining the same tunnelName name in case of an SHH client interruption,
+	// Firstly, the tunnelName must not be taken.
+	// The client must send its tunnelName name via a channel along with an id (id=dhskjdshf24343,tunnelName=tunnel)
 	// TODO: Move to another func
 	cmdParts := strings.Split(session.request, ",")
 	clientID := ""
-	subdomain := ""
+	tunnelName := ""
 	header := ""
 	headerSpecified := false
 	for _, p := range cmdParts {
 		p = strings.ToLower(strings.TrimSpace(p))
 		idIndex := strings.Index(p, "id=")
-		subdomainIndex := strings.Index(p, "subdomain=")
+		tunnelNameIndex := strings.Index(p, "tunnelname=")
+
 		headerIndex := strings.Index(p, "header=")
 		if idIndex == 0 {
 			// Found id
 			clientID = p[idIndex+len("id="):]
-		} else if subdomainIndex == 0 {
-			// Found subdomain
-			subdomain = p[subdomainIndex+len("subdomain="):]
+		} else if tunnelNameIndex == 0 {
+			// Found tunnelName
+			tunnelName = p[tunnelNameIndex+len("tunnelname="):]
 		} else if headerIndex == 0 {
-			// Found subdomain
+			// Found header
 			header = p[headerIndex+len("header="):]
 			headerSpecified = true
 		}
@@ -82,7 +83,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	// Server localhost:port to listen for http requests at
 	addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 
-	// Update connection with subdomain and payload
+	// Update connection with tunnelName and payload
 	conn.SetRequestForwardPayload(&reqPayload)
 
 	// TCP or HTTP?
@@ -90,25 +91,25 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	// For HTTP (port 80/httpBindPort), the connection is shared and thus many-to-one meaning the local listener on server is shared across many HTTP Clients.
 	if int(reqPayload.BindPort) == httpBindPort {
 		// Mimic ^[a-zA-Z0-9](?!.*--)[a-zA-Z0-9-]+[a-zA-Z0-9]$ as Go does not support lookarounds
-		subdomainValid := subDomainValid(subdomain)
+		tunnelNameValid := tunnelNameValid(tunnelName)
 
-		if subdomain != "" && !subdomainValid {
-			log.Printf("Specified subdomain '%s' not valid", subdomain)
-			io.WriteString(session.channel, fmt.Sprintf("Specified subdomain '%s' not valid\n", subdomain))
+		if tunnelName != "" && !tunnelNameValid {
+			log.Printf("Specified tunnelName '%s' not valid", tunnelName)
+			io.WriteString(session.channel, fmt.Sprintf("Specified tunnelName '%s' not valid\n", tunnelName))
 		}
 
 		var err error
 		tunnelNameTakenOrInvalid := false
 
 		sshTunnelListenersLock.Lock()
-		if subdomainValid {
-			s, ok := sshTunnelListeners[addr+subdomain]
+		if tunnelNameValid {
+			s, ok := sshTunnelListeners[addr+tunnelName]
 			if ok && s.clientID == clientID {
-				log.Printf("Discarding existing subdomain cache for same client id %s", clientID)
+				log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
 				tunnelNameTakenOrInvalid = false
 			} else if ok && s.clientID != clientID {
 				tunnelNameTakenOrInvalid = true
-				io.WriteString(session.channel, fmt.Sprintf("Specified subdomain '%s' already taken\n", subdomain))
+				io.WriteString(session.channel, fmt.Sprintf("Specified tunnelName '%s' already taken\n", tunnelName))
 			}
 		} else {
 			tunnelNameTakenOrInvalid = true
@@ -116,21 +117,21 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 
 		for {
 			if tunnelNameTakenOrInvalid {
-				subdomain, err = generateRandomSubdomain()
+				tunnelName, err = generateRandomTunnelName()
 				if err != nil {
-					log.Printf("error generating subdomain: %s", err)
-					return false, []byte("error generating subdomain")
+					log.Printf("error generating tunnelName: %s", err)
+					return false, []byte("error generating tunnelName")
 				}
-				_, tunnelNameTakenOrInvalid = sshTunnelListeners[addr+subdomain]
+				_, tunnelNameTakenOrInvalid = sshTunnelListeners[addr+tunnelName]
 			} else {
 				break
 			}
 		}
 
-		// Cache context under subdomain and local bind address (localhost:80)
-		log.Printf("using subdomain %s", subdomain)
+		// Cache context under tunnelName and local bind address (localhost:80)
+		log.Printf("using tunnelName %s", tunnelName)
 
-		conn.SetSubDomain(subdomain)
+		conn.SetTunnelName(tunnelName)
 		sshListenerData := sshTunnelsListenerData{
 			conn:       conn,
 			reqPayload: &reqPayload,
@@ -141,11 +142,15 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		if headerSpecified {
 			sshListenerData.hostHeader = &header
 		}
-		sshTunnelListeners[addr+subdomain] = sshListenerData
+		sshTunnelListeners[addr+tunnelName] = sshListenerData
 
 		sshTunnelListenersLock.Unlock()
 
-		io.WriteString(session.channel, fmt.Sprintf("https://%s.%s\n", subdomain, domain))
+		if domainPath {
+			io.WriteString(session.channel, fmt.Sprintf("%s/%s\n", domainURL, tunnelName))
+		} else {
+			io.WriteString(session.channel, fmt.Sprintf("%s.%s\n", tunnelName, domainURL))
+		}
 
 		log.Printf("Received tcpip-forward for session %s started", hex.EncodeToString(conn.SessionID()))
 
@@ -227,7 +232,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 			// Port not taken by taken same client
 			// create a new listener
 			if o.clientID == clientID {
-				log.Printf("Discarding existing subdomain cache for same client id %s", clientID)
+				log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
 				o.listener.Close()
 			}
 
@@ -246,7 +251,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		}
 		forwardsLock.Unlock()
 
-		io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domain, requestBindPort))
+		io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domainURL, requestBindPort))
 
 		go func() {
 			for {
@@ -346,8 +351,16 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		// TODO: Reuse httpProcessor across multiple requests on the same TCP connection
 		httpProcessor := newHttpProcessor(httpConnection, *httpBuf)
 
-		// Extract headers to get subdomain
-		host, err := httpProcessor.GetHost()
+		// Extract http request headers to get tunnelName
+		var tunnelName string
+		var host string
+		var path string
+		var err error
+		if domainPath {
+			path, err = httpProcessor.GetURLPath()
+		} else {
+			host, err = httpProcessor.GetHost()
+		}
 		if err != nil && hadPreviousRequests && (err == io.EOF || strings.HasSuffix(err.Error(), ": EOF") ||
 			strings.Contains(err.Error(), "use of closed network connection")) {
 			// Expected error client only wanted one request
@@ -356,20 +369,38 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		}
 		log.Printf("Http request started")
 		if err != nil {
-			log.Printf("could not find Host header: %s", err)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid Host.")
+			if domainPath {
+				log.Printf("could not find URL path: %s", err)
+				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid URL path.")
+
+			} else {
+				log.Printf("could not find Host header: %s", err)
+				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid Host.")
+			}
 			httpConnection.Close()
 
 			return
 		}
-		subdomain, err := extractSubdomain(host)
+		if domainPath {
+			tunnelName, err = extractTunnelNameFromURLPath(path, domainURI)
+
+		} else {
+			tunnelName, err = extractSubdomain(host)
+		}
 		if err != nil {
-			log.Printf("could not find Host header: %s", err)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid Host.")
+			if domainPath {
+				log.Printf("could not find URL path: %s", err)
+				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid URL path.")
+
+			} else {
+				log.Printf("could not find Host header: %s", err)
+				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid Host.")
+			}
 			httpConnection.Close()
 
 			return
 		}
+
 		hadPreviousRequests = true
 		if _, ok := httpProcessor.GetContentLength(); !ok {
 			// Invalid content-length
@@ -381,12 +412,12 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 
 		log.Printf("Incoming http request from %s", httpConnection.RemoteAddr())
 
-		log.Printf("Found subdomain %q in http request", subdomain)
+		log.Printf("Found tunnelName %q in http request", tunnelName)
 
-		sshClient, ok := sshTunnelListeners[addr+subdomain]
+		sshClient, ok := sshTunnelListeners[addr+tunnelName]
 		if !ok {
-			log.Printf("no listeners found for the subdomain %s", subdomain)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo listeners found for this subdomain.")
+			log.Printf("no listeners found for the tunnelName %s", tunnelName)
+			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo listeners found for this tunnelName.")
 			httpConnection.Close()
 
 			return
@@ -397,8 +428,8 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		}
 		sshReqPayload := sshClient.reqPayload
 		if sshReqPayload == nil {
-			log.Printf("no SSH clients found for the subdomain %s", subdomain)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo SSH client found for this subdomain.")
+			log.Printf("no SSH clients found for the tunnelName %s", tunnelName)
+			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo SSH client found for this tunnelName.")
 			httpConnection.Close()
 
 			return
@@ -408,6 +439,16 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		if sshClient.hostHeader != nil {
 			log.Printf("Setting Host header to %q", *sshClient.hostHeader)
 			httpProcessor.SetHostHeader(*sshClient.hostHeader)
+		}
+
+		httpProcessor.ReadHeadersIfNeeded()
+		if httpProcessor.request {
+
+			newURL, _ := replaceRequestURL(httpProcessor.requestRawURI, sshClient.hostHeader, domainURI.Path+"/"+tunnelName)
+			if newURL != httpProcessor.requestRawURI {
+				log.Debugf("Adjusting http request URL from %q to %q", httpProcessor.requestRawURI, newURL)
+				httpProcessor.replaceHttpRequestURL(newURL)
+			}
 		}
 
 		originAddr, orignPortStr, _ := net.SplitHostPort(httpConnection.RemoteAddr().String())
@@ -500,9 +541,9 @@ func cancelForwardHandler(conn *sshConnection, req *ssh.Request, ctx context.Con
 	}
 	if reqPayload.BindPort == httpBindPort {
 		// We don't want to delete the only HTTP listener we have
-		subdomain := conn.GetSubDomain()
-		if subdomain != nil {
-			cacheKey := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort))) + *conn.GetSubDomain()
+		tunnelName := conn.GetTunnelName()
+		if tunnelName != nil {
+			cacheKey := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort))) + *conn.GetTunnelName()
 
 			sshTunnelListenersLock.Lock()
 			s, ok := sshTunnelListeners[cacheKey]
