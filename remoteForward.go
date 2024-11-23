@@ -251,7 +251,8 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		}
 		forwardsLock.Unlock()
 
-		io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domainURL, requestBindPort))
+		// Write server host:port to the SSH client.
+		io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domainURI.Hostname(), requestBindPort))
 
 		go func() {
 			for {

@@ -23,6 +23,7 @@ import (
 )
 
 // DNS domainURL. This might include a path but only when domainPath is true.
+// This will be used for both TCP and HTTP tunnels. For TCP, the host name part is used.
 var domainURL string
 var domainURI url.URL
 
@@ -49,8 +50,8 @@ func init() {
 
 func main() {
 
-	// --domainUrl="domain.io"
-	domainPtr := flag.String("domainUrl", "", "DNS domain URL (eg domain.io) that points to this server.")
+	// --domainUrl="https://domain.io"
+	domainPtr := flag.String("domainUrl", "", "DNS domain URL (eg https://domain.io) that points to this server. Users will use this url to send HTTP requests and will use the host part of this url for TCP communication.")
 
 	// --domainPath=true or --domainPath
 	domainPathPtr := flag.Bool("domainPath", false, "Instead opf subdomains, use a URL query path for user tunnels.")
