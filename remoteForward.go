@@ -149,7 +149,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		if domainPath {
 			io.WriteString(session.channel, fmt.Sprintf("%s/%s\n", domainURL, tunnelName))
 		} else {
-			io.WriteString(session.channel, fmt.Sprintf("%s.%s\n", tunnelName, domainURL))
+			io.WriteString(session.channel, fmt.Sprintf("%s://%s.%s\n", domainURI.Scheme, tunnelName, domainURI.Hostname()))
 		}
 
 		log.Printf("Received tcpip-forward for session %s started", hex.EncodeToString(conn.SessionID()))
