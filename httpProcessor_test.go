@@ -148,6 +148,33 @@ var _ = Describe("HttpProcessor", func() {
 		}
 	})
 
+	It("should process when the word Host appears elsewhere", func() {
+		// The word Host appears in the URL and in another header but those should be left intact.
+		for _, expectedHeader := range []string{"a.b.com", "tunnel.test.domain.io"} {
+			body := "POST /url/GetByHostName HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 12\r\nHost: domain.io\r\nHostX: another.io\r\nOrigin: https://domain.io:123\r\n\r\nBody is here"
+			oldHeader := "domain.io"
+			reader := strings.NewReader(body)
+			bufferSize := len(body) * 3
+			buffer := make([]byte, bufferSize)
+			sut := newHttpProcessor(reader, buffer)
+			sut.SetHostHeader(expectedHeader)
+			host, err := sut.GetHost()
+			Expect(err).To(Not(HaveOccurred()))
+			Expect(host, expectedHeader)
+
+			origin := sut.headers["Origin"][0]
+			Expect(origin, "https://"+expectedHeader+":123")
+
+			hostX := sut.headers["Hostx"][0]
+			Expect(hostX, "another.io")
+
+			p := make([]byte, len(body)+2*(len(expectedHeader)-len(oldHeader)))
+			_, err = sut.GetReader().Read(p)
+			Expect(string(p)).To(Equal(strings.Replace(body, oldHeader, expectedHeader, -1)))
+			Expect(err).To(Not(HaveOccurred()))
+		}
+	})
+
 	It("should process when buffer size is larger than body", func() {
 		for _, expectedHeader := range []string{"a.b.com", "tunnel.test.domain.io"} {
 			body := "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 12\r\nHost: domain.io\nOrigin: https://domain.io:123\r\n\r\nBody is here"

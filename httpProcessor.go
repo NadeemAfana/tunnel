@@ -281,10 +281,36 @@ func (h *httpProcessor) replaceHeader(headerName string, headerValue string) {
 
 			// Update internal buffer if it has not been used
 			if !h.bufferUsed {
-				start := bytes.Index(h.buf, []byte(headerName))
-				if start < 0 {
+				var start = 0
+				found := false
+				c := 0
+				for {
+					// Expect "HeaderName:" since the same value of the header could be somewhere else (eg url)
+					if c >= len(h.buf) {
+						break
+					}
+					start = bytes.Index(h.buf[c:], []byte(headerName))
+					if start < 0 {
+						break
+					}
+					c = c + start
+					// header name must be followed by ":"
+					if string(h.buf[c+len(headerName):])[0] != byte(':') {
+						c = c + len(headerName)
+						continue
+					}
+					// header name must be preceded by "\n"
+					if h.buf[c-1:][0] != byte('\n') {
+						c = c + len(headerName)
+						continue
+					}
+					found = true
+					break
+				}
+				if !found {
 					return
 				}
+				start = c
 				end := bytes.Index(h.buf[start:], []byte("\n"))
 				if end < 0 {
 					return
@@ -294,13 +320,17 @@ func (h *httpProcessor) replaceHeader(headerName string, headerValue string) {
 				tempFixed := bytes.Replace(temp, []byte(oldHeader[0]), []byte(headerValue), 1)
 				h.buf = bytes.Replace(h.buf, temp, tempFixed, 1)
 				headerDiff := len(headerValue) - len(oldHeader[0])
-				h.bufWritePos += headerDiff
-				h.bodyStartsIndex += headerDiff
-				h.bufferBytesRead += int64(headerDiff)
-				h.adjustBodyReader()
+				h.adjustBufferPositions(headerDiff)
 			}
 		}
 	}
+}
+
+func (h *httpProcessor) adjustBufferPositions(offset int) {
+	h.bufWritePos += offset
+	h.bodyStartsIndex += offset
+	h.bufferBytesRead += int64(offset)
+	h.adjustBodyReader()
 }
 
 func (h *httpProcessor) replaceHttpRequestURL(newURL string) {
@@ -330,10 +360,8 @@ func (h *httpProcessor) replaceHttpRequestURL(newURL string) {
 			tempFixed := bytes.Replace(temp, []byte(h.requestRawURI), []byte(newURL), 1)
 			h.buf = bytes.Replace(h.buf, temp, tempFixed, 1)
 			diff := len(newURL) - len(h.requestRawURI)
-			h.bufWritePos += diff
-			h.bodyStartsIndex += diff
-			h.bufferBytesRead += int64(diff)
-			h.adjustBodyReader()
+
+			h.adjustBufferPositions(diff)
 			h.requestRawURI = newURL
 		}
 	}
