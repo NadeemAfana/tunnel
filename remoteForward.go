@@ -386,7 +386,7 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 			tunnelName, err = extractTunnelNameFromURLPath(path, domainURI)
 
 		} else {
-			tunnelName, err = extractSubdomain(host)
+			tunnelName, err = extractSubdomain(host, domainURI.Host)
 		}
 		if err != nil {
 			if domainPath {
@@ -418,7 +418,7 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		sshClient, ok := sshTunnelListeners[addr+tunnelName]
 		if !ok {
 			log.Printf("no listeners found for the tunnelName %s", tunnelName)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo listeners found for this tunnelName.")
+			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo listeners found.")
 			httpConnection.Close()
 
 			return
@@ -430,7 +430,7 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		sshReqPayload := sshClient.reqPayload
 		if sshReqPayload == nil {
 			log.Printf("no SSH clients found for the tunnelName %s", tunnelName)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo SSH client found for this tunnelName.")
+			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo SSH client found.")
 			httpConnection.Close()
 
 			return

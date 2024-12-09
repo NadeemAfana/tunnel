@@ -72,6 +72,19 @@ func (h *httpProcessor) Close() {
 	h.lastError = io.ErrUnexpectedEOF
 }
 
+func (h *httpProcessor) GetReferer() (string, error) {
+	err := h.ReadHeadersIfNeeded()
+	if err != nil {
+		return "", err
+	}
+
+	if header, ok := h.headers["Referer"]; ok && len(header) == 1 {
+		return header[0], nil
+	}
+
+	return "", errors.New("could not find Referer header")
+}
+
 func (h *httpProcessor) GetHost() (string, error) {
 	err := h.ReadHeadersIfNeeded()
 	if err != nil {

@@ -54,7 +54,7 @@ func main() {
 	domainPtr := flag.String("domainUrl", "", "DNS domain URL (eg https://domain.io) that points to this server. Users will use this url to send HTTP requests and will use the host part of this url for TCP communication.")
 
 	// --domainPath=true or --domainPath
-	domainPathPtr := flag.Bool("domainPath", false, "Instead opf subdomains, use a URL query path for user tunnels.")
+	domainPathPtr := flag.Bool("domainPath", false, "Instead of subdomains, use a URL query path for user tunnels.")
 
 	// --log=info
 	logPtr := flag.String("log", "info", "Log level: debug, info, warn, or error.")

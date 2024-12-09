@@ -44,17 +44,9 @@ func tunnelNameValid(tunnelName string) bool {
 
 // Returns subdomain if found from host name, or domain, or an empty string
 // host must be valid.
-func extractSubdomain(host string) (string, error) {
-
-	// Extract domain from domainURL
-	domainEndIndex := strings.Index(domainURL, "/")
-	if domainEndIndex == -1 {
-		domainEndIndex = len(domainURL)
-	}
-	domain := domainURL[:domainEndIndex]
-
+func extractSubdomain(host string, domainHost string) (string, error) {
 	// Find domain in host
-	domainIndex := strings.Index(host, domain)
+	domainIndex := strings.Index(host, domainHost)
 	if domainIndex <= 0 {
 		return "", errors.New("could not find a valid subdomain in http request headers")
 	}
@@ -95,8 +87,8 @@ func replaceRequestURL(requestURL string, newHost *string, stripPrefixPath strin
 	}
 
 	// Ensure path starts with / if it is relative.
-	if !replacedURL.IsAbs() && replacedURL.Path == "" {
-		replacedURL.Path = "/"
+	if !replacedURL.IsAbs() && !strings.HasPrefix(replacedURL.Path, "/") {
+		replacedURL.Path = "/" + replacedURL.Path
 	}
 
 	return replacedURL.String(), nil

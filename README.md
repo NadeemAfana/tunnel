@@ -24,7 +24,7 @@ The app will assign a unique subdomain for each HTTP client. For example, if you
 2. Run the server 
     ```
     CGO_ENABLED=0 go build
-    ./tunnel --domainUrl=mydomain.io
+    ./tunnel --domainUrl=https://mydomain.io
     ```
 
     For Docker
@@ -49,7 +49,7 @@ If you cannot use subdomains, a single domain can be used for all users using a 
 
 Run the server with 
 ```
-./tunnel --domainUrl=mydomain.io --domainPath
+./tunnel --domainUrl=https://mydomain.io --domainPath
 ```
 and then create the tunnel on the client:
 

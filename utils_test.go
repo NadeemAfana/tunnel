@@ -57,23 +57,25 @@ var _ = Describe("utils", func() {
 	Context("extractSubdomain from host", func() {
 
 		It("should error on empty subdomain", func() {
-			for _, host := range []string{domainURL} {
-				_, err := extractSubdomain(host)
+			for _, host := range []string{""} {
+				_, err := extractSubdomain(host, domainURL)
 				Expect(err).To(HaveOccurred())
 			}
 		})
 
 		It("should extract subdomain", func() {
+			domainURL := "domain.io"
 			for _, host := range []string{"abc." + domainURL} {
-				s, err := extractSubdomain(host)
+				s, err := extractSubdomain(host, domainURL)
 				Expect(err).To(Not(HaveOccurred()))
 				Expect(s).To(Equal("abc"))
 			}
 		})
 
 		It("should extract subdomain", func() {
+			domainURL := "domain.io"
 			for _, host := range []string{"open-idc." + domainURL} {
-				s, err := extractSubdomain(host)
+				s, err := extractSubdomain(host, domainURL)
 				Expect(err).To(Not(HaveOccurred()))
 				Expect(s).To(Equal("open-idc"))
 			}
@@ -186,6 +188,15 @@ var _ = Describe("utils", func() {
 				s, err := replaceRequestURL(value, nil, "")
 				Expect(err).To(Not(HaveOccurred()))
 				Expect(s).To(Equal("/"))
+			}
+		})
+
+		It("should replace request URL when requestURL has relative path and prefix has different path", func() {
+			for _, value := range []string{"/relative"} {
+				s, err := replaceRequestURL(value, nil, "/path")
+				Expect(err).To(Not(HaveOccurred()))
+				Expect(s).To(Equal("/relative"))
+
 			}
 		})
 
