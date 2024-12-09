@@ -12,6 +12,8 @@ type sshTunnelsListenerData struct {
 	sessionID  string
 	clientID   string // For reconnecting: allow client to re-use same subdomain
 	hostHeader *string
+	// Is the client TCP or http?
+	connectionType string
 }
 
 type forwardsListenerData struct {

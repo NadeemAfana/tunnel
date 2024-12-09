@@ -14,8 +14,6 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
-var zeroLengthChunk = []byte("0\r\n\r\n")
-
 type httpProcessor struct {
 	buf                     []byte
 	reader                  io.Reader

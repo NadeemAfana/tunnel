@@ -29,6 +29,7 @@ printHelp () {
   printf "  %-28s Creates a TCP tunnel at local port 3001 and remote port 5224.\n\n" "tunnel.sh tcp  3001 -p 5224"
   printf '\nArguments\n'
   printf "  %-25s Uses an HTTP tunnel.\n"  "http, --http"
+  printf "  %-25s Uses an HTTPs tunnel.\n"  "https, --https"
   printf "  %-25s Uses a TCP tunnel.\n"  "tcp, --tcp"
   
   printf "  %-25s Runs in debug mode where more info is printed on the screen\n"  "--debug"
@@ -69,6 +70,8 @@ while [ "$1" != "" ]; do
                                 ;;                                                               
         http | --http)          type="http"
                                 ;;
+        https | --https)        type="https"
+                                ;;
         tcp | --tcp)            type="tcp"
                                 ;;
             --debug)            debug=true
@@ -99,7 +102,7 @@ if echo "$localHostPort" | grep -qE '^[0-9]+$'; then
 fi
 
 
-if [[ $type = "http" ]]; then  
+if [[ $type = "http" || $type = "https" ]]; then  
   httpPort=true
 else
   httpPort=false
@@ -131,7 +134,7 @@ fi
 
 
 # Default arguments to pass to SSH server. The default tunnelName is the current user name. Override the host header with 'localhost'
-sshServerArgs="tunnelName=$tunnelName,header=$overrideHeaderHost,id=`cat /proc/sys/kernel/random/uuid`"
+sshServerArgs="tunnelName=$tunnelName,type=$type,header=$overrideHeaderHost,id=`cat /proc/sys/kernel/random/uuid`"
 
 # Extra args to pass to SSH cli
 sshCliArgs=" -o ConnectionAttempts=$((10**4))  -o ServerAliveInterval=20 -o ServerAliveCountMax=2"
@@ -140,7 +143,7 @@ if [[ $key  ]]; then
   sshCliArgs="$sshCliArgs -i $key"
 fi
 
-if [[ $remotePort == 80 && "$httpPort" = false  ]]; then  
+if [[ $remotePort == 80 && "$httpPort" == false  ]]; then  
   remotePort=$serverTcpBindingPort
 fi
 
@@ -198,4 +201,3 @@ stdbuf -oL head $fifo -n $((10**10)) | grep --line-buffered '.*' |
         printf '%s\n' "${LINE0}"
     fi
   done
-

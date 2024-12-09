@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -55,19 +56,30 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	clientID := ""
 	tunnelName := ""
 	header := ""
+	connectionType := ""
 	headerSpecified := false
+
 	for _, p := range cmdParts {
 		p = strings.ToLower(strings.TrimSpace(p))
 		idIndex := strings.Index(p, "id=")
 		tunnelNameIndex := strings.Index(p, "tunnelname=")
-
+		connTypeIndex := strings.Index(p, "type=")
 		headerIndex := strings.Index(p, "header=")
+
 		if idIndex == 0 {
 			// Found id
 			clientID = p[idIndex+len("id="):]
 		} else if tunnelNameIndex == 0 {
 			// Found tunnelName
 			tunnelName = p[tunnelNameIndex+len("tunnelname="):]
+		} else if connTypeIndex == 0 {
+			// Found connectio type
+			connectionType = p[connTypeIndex+len("type="):]
+
+			if connectionType != "https" && connectionType != "http" && connectionType != "tcp" {
+				log.Printf("invalid connectionType %s", connectionType)
+				return false, []byte(fmt.Sprintf("invalid connectionType %s", connectionType))
+			}
 		} else if headerIndex == 0 {
 			// Found header
 			header = p[headerIndex+len("header="):]
@@ -89,7 +101,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	// TCP or HTTP?
 	// For TCP, the connection is one-to-one meaning the local listener is exclusively for this SSH client.
 	// For HTTP (port 80/httpBindPort), the connection is shared and thus many-to-one meaning the local listener on server is shared across many HTTP Clients.
-	if int(reqPayload.BindPort) == httpBindPort {
+	if connectionType == "http" || connectionType == "https" {
 		// Mimic ^[a-zA-Z0-9](?!.*--)[a-zA-Z0-9-]+[a-zA-Z0-9]$ as Go does not support lookarounds
 		tunnelNameValid := tunnelNameValid(tunnelName)
 
@@ -133,15 +145,17 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 
 		conn.SetTunnelName(tunnelName)
 		sshListenerData := sshTunnelsListenerData{
-			conn:       conn,
-			reqPayload: &reqPayload,
-			sessionID:  hex.EncodeToString(conn.SessionID()),
-			clientID:   clientID,
-			hostHeader: nil,
+			conn:           conn,
+			reqPayload:     &reqPayload,
+			sessionID:      hex.EncodeToString(conn.SessionID()),
+			clientID:       clientID,
+			hostHeader:     nil,
+			connectionType: connectionType,
 		}
 		if headerSpecified {
 			sshListenerData.hostHeader = &header
 		}
+
 		sshTunnelListeners[addr+tunnelName] = sshListenerData
 
 		sshTunnelListenersLock.Unlock()
@@ -208,6 +222,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 
 		return true, ssh.Marshal(&remoteForwardSuccess{uint32(destPort)})
 	} else {
+
 		var ln net.Listener
 		var err error
 		forwardsLock.Lock()
@@ -469,6 +484,21 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 			log.Printf("error opening %s channel: %s", forwardedTCPChannelType, err)
 			return
 		}
+
+		// If the client specified "https", wrap the connection with tls.
+		// Need to wrap sshChannel with net.Conn methods.
+		var sshChannelConn net.Conn
+
+		if sshClient.connectionType == "https" {
+			// No need to verify TLS chain as the user manually requested it and to allow self-signed certificates to work.
+			// Also, this improves performance.
+			sshChannelConn = tls.Client(newSSHChannelConnection(&sshChannel, conn.cancellationCtx), &tls.Config{InsecureSkipVerify: true})
+
+		} else {
+			// http
+			sshChannelConn = newSSHChannelConnection(&sshChannel, conn.cancellationCtx)
+		}
+
 		// Remote http connection underlying TCP socket closed remotely
 		remoteTCPConnectionClose := false
 		var wg sync.WaitGroup
@@ -485,7 +515,7 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 			buf := bufPool.Get().(*[]byte)
 			defer bufPool.Put(buf)
 
-			n, err := io.CopyBuffer(sshChannel, httpProcessor.GetReader(), *buf)
+			n, err := io.CopyBuffer(sshChannelConn, httpProcessor.GetReader(), *buf)
 			if err != nil {
 				log.Debugf("error copying to SSH channel: %s", err)
 			}
@@ -505,9 +535,9 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 			buf2 := bufPool.Get().(*[]byte)
 			defer bufPool.Put(buf2)
 
-			defer sshChannel.Close()
+			defer sshChannelConn.Close()
 			// Wrap sshChannel as well to avoid calling .Read multiple times. Otherwise, this will block.
-			sshChannelWrapper := &eofReader{r: sshChannel}
+			sshChannelWrapper := &eofReader{r: sshChannelConn}
 			responseHttpProcessor := newHttpProcessor(sshChannelWrapper, *buf2)
 			responseHttpProcessor.requestMethod = httpProcessor.requestMethod
 			n, err := io.CopyBuffer(httpConnection, responseHttpProcessor.GetReader(), *buf)

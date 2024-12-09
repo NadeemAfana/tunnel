@@ -67,11 +67,15 @@ Create an HTTP tunnel at local port 3000 at subdomain 'abc' (`https://abc.mydoma
 tunnel.sh 3000 -s abc
 ```
 
- Create an HTTP tunnel for forward host example.com at port 3000 (`https://username.mydomain.io` points to `http://example.com:3000`):
+Create an HTTP tunnel for forward host example.com at port 3000 (`https://username.mydomain.io` points to `http://example.com:3000`):
 ```
 tunnel.sh example.com:3000
 ```
 
+Create an HTTPS tunnel for forward host example.com at port 3000 (`https://username.mydomain.io` points to `https://example.com`):
+```
+tunnel.sh example.com:443 --https
+```
 
 Create a TCP tunnel at local port 3001 and remote port 5224.
 ```
