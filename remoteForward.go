@@ -460,7 +460,11 @@ func handleHttpConnection(httpConnection net.Conn, addr string) {
 		httpProcessor.ReadHeadersIfNeeded()
 		if httpProcessor.request {
 
-			newURL, _ := replaceRequestURL(httpProcessor.requestRawURI, sshClient.hostHeader, domainURI.Path+"/"+tunnelName)
+			stripUrlPrefix := ""
+			if domainPath {
+				stripUrlPrefix = domainURI.Path + "/" + tunnelName
+			}
+			newURL, _ := replaceRequestURL(httpProcessor.requestRawURI, sshClient.hostHeader, stripUrlPrefix)
 			if newURL != httpProcessor.requestRawURI {
 				log.Debugf("Adjusting http request URL from %q to %q", httpProcessor.requestRawURI, newURL)
 				httpProcessor.replaceHttpRequestURL(newURL)
