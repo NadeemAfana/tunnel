@@ -3,62 +3,92 @@ package main
 import (
 	"context"
 	"net"
+	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
-// Wraps ssh.Channel with net.Conn
+// Wraps ssh.Channel with net.Conn. SetReadDeadline/SetWriteDeadline are
+// implemented via a timer that closes the underlying SSH channel on expiry,
+// which unblocks any pending Read/Write. A pending Read/Write that hits a
+// deadline returns os.ErrDeadlineExceeded and leaves the channel closed —
+// callers (notably net/http's Transport) are expected to discard the conn
+// on deadline exceeded, so reuse-after-deadline is not supported.
 type sshChannelConnection struct {
 	net.Conn
 	sshChannel      *ssh.Channel
 	cancellationCtx context.Context
+
+	readDeadline  pipeDeadline
+	writeDeadline pipeDeadline
 }
 
 func (c *sshChannelConnection) Read(b []byte) (n int, err error) {
-	return (*c.sshChannel).Read(b)
+	if isClosedChan(c.readDeadline.wait()) {
+		return 0, os.ErrDeadlineExceeded
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := (*c.sshChannel).Read(b)
+		done <- result{n, err}
+	}()
+
+	select {
+	case r := <-done:
+		return r.n, r.err
+	case <-c.readDeadline.wait():
+		(*c.sshChannel).Close()
+		return 0, os.ErrDeadlineExceeded
+	}
 }
 
 func (c *sshChannelConnection) Write(b []byte) (n int, err error) {
-	return (*c.sshChannel).Write(b)
+	if isClosedChan(c.writeDeadline.wait()) {
+		return 0, os.ErrDeadlineExceeded
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := (*c.sshChannel).Write(b)
+		done <- result{n, err}
+	}()
+
+	select {
+	case r := <-done:
+		return r.n, r.err
+	case <-c.writeDeadline.wait():
+		(*c.sshChannel).Close()
+		return 0, os.ErrDeadlineExceeded
+	}
 }
 
 func (c *sshChannelConnection) Close() error {
+	// Clear any armed timers so the runtime doesn't hold references past Close.
+	c.readDeadline.set(time.Time{})
+	c.writeDeadline.set(time.Time{})
 	return (*c.sshChannel).Close()
 }
 
 func (c *sshChannelConnection) LocalAddr() net.Addr {
-	// Not used
-	return nil
+	return sshChannelAddr{}
 }
 
 func (c *sshChannelConnection) RemoteAddr() net.Addr {
-	return nil
+	return sshChannelAddr{}
 }
 
-// SetDeadline sets the read and write deadlines associated
-// with the connection. It is equivalent to calling both
-// SetReadDeadline and SetWriteDeadline.
-//
-// A deadline is an absolute time after which I/O operations
-// fail instead of blocking. The deadline applies to all future
-// and pending I/O, not just the immediately following call to
-// Read or Write. After a deadline has been exceeded, the
-// connection can be refreshed by setting a deadline in the future.
-//
-// If the deadline is exceeded a call to Read or Write or to other
-// I/O methods will return an error that wraps os.ErrDeadlineExceeded.
-// This can be tested using errors.Is(err, os.ErrDeadlineExceeded).
-// The error's Timeout method will return true, but note that there
-// are other possible errors for which the Timeout method will
-// return true even if the deadline has not been exceeded.
-//
-// An idle timeout can be implemented by repeatedly extending
-// the deadline after successful Read or Write calls.
-//
-// A zero value for t means I/O operations will not time out.
 func (c *sshChannelConnection) SetDeadline(t time.Time) error {
-
 	if err := c.SetReadDeadline(t); err != nil {
 		return err
 	}
@@ -66,20 +96,87 @@ func (c *sshChannelConnection) SetDeadline(t time.Time) error {
 }
 
 func (c *sshChannelConnection) SetReadDeadline(t time.Time) error {
-	// TODO: Implement using a channel
+	c.readDeadline.set(t)
 	return nil
 }
 
-// SetWriteDeadline sets the deadline for future Write calls
-// and any currently-blocked Write call.
-// Even if write times out, it may return n > 0, indicating that
-// some of the data was successfully written.
-// A zero value for t means Write will not time out.
 func (c *sshChannelConnection) SetWriteDeadline(t time.Time) error {
-	// TODO: Implement using a channel
+	c.writeDeadline.set(t)
 	return nil
 }
 
 func newSSHChannelConnection(sshChannel *ssh.Channel, cancellationCtx context.Context) *sshChannelConnection {
-	return &sshChannelConnection{sshChannel: sshChannel, cancellationCtx: cancellationCtx}
+	return &sshChannelConnection{
+		sshChannel:      sshChannel,
+		cancellationCtx: cancellationCtx,
+		readDeadline:    makePipeDeadline(),
+		writeDeadline:   makePipeDeadline(),
+	}
+}
+
+// sshChannelAddr is a non-nil placeholder so callers that invoke LocalAddr /
+// RemoteAddr (e.g. net/http for logging) don't get a nil interface.
+type sshChannelAddr struct{}
+
+func (sshChannelAddr) Network() string { return "ssh" }
+func (sshChannelAddr) String() string  { return "ssh-channel" }
+
+// pipeDeadline is the same deadline primitive used by Go's net.Pipe: calling
+// set(t) arms a timer that closes the channel returned by wait() when t
+// elapses. Setting a zero time clears the deadline.
+type pipeDeadline struct {
+	mu     sync.Mutex
+	timer  *time.Timer
+	cancel chan struct{}
+}
+
+func makePipeDeadline() pipeDeadline {
+	return pipeDeadline{cancel: make(chan struct{})}
+}
+
+func (d *pipeDeadline) set(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.timer != nil && !d.timer.Stop() {
+		<-d.cancel // wait for timer callback to finish closing cancel
+	}
+	d.timer = nil
+
+	closed := isClosedChan(d.cancel)
+	if t.IsZero() {
+		if closed {
+			d.cancel = make(chan struct{})
+		}
+		return
+	}
+
+	if dur := time.Until(t); dur > 0 {
+		if closed {
+			d.cancel = make(chan struct{})
+		}
+		d.timer = time.AfterFunc(dur, func() {
+			close(d.cancel)
+		})
+		return
+	}
+
+	if !closed {
+		close(d.cancel)
+	}
+}
+
+func (d *pipeDeadline) wait() chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cancel
+}
+
+func isClosedChan(c <-chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
 }

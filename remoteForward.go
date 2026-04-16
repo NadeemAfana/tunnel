@@ -4,12 +4,16 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -27,6 +31,19 @@ var bufPool = sync.Pool{
 		buffer := make([]byte, bufferSize)
 		return &buffer
 	},
+}
+
+type ctxKey int
+
+const (
+	ctxKeyTunnel ctxKey = iota
+	ctxKeyOrigin
+	ctxKeyTunnelName
+)
+
+type originInfo struct {
+	addr string
+	port uint32
 }
 
 func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted chan execRequestCompletedData, cancellationCtx context.Context) (bool, []byte) {
@@ -67,13 +84,10 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		headerIndex := strings.Index(p, "header=")
 
 		if idIndex == 0 {
-			// Found id
 			clientID = p[idIndex+len("id="):]
 		} else if tunnelNameIndex == 0 {
-			// Found tunnelName
 			tunnelName = p[tunnelNameIndex+len("tunnelname="):]
 		} else if connTypeIndex == 0 {
-			// Found connectio type
 			connectionType = p[connTypeIndex+len("type="):]
 
 			if connectionType != "https" && connectionType != "http" && connectionType != "tcp" {
@@ -81,7 +95,6 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 				return false, []byte(fmt.Sprintf("invalid connectionType %s", connectionType))
 			}
 		} else if headerIndex == 0 {
-			// Found header
 			header = p[headerIndex+len("header="):]
 			headerSpecified = true
 		}
@@ -140,7 +153,6 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 			}
 		}
 
-		// Cache context under tunnelName and local bind address (localhost:80)
 		log.Printf("using tunnelName %s", tunnelName)
 
 		conn.SetTunnelName(tunnelName)
@@ -168,404 +180,351 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 
 		log.Printf("Received tcpip-forward for session %s started", hex.EncodeToString(conn.SessionID()))
 
-		// Initially, I tried using the Go built-in http server instead of peeking through TCP data.
-		// However, that opened a can of wormholes. The default http implementation got in the way, so
-		// I had to hijack the connection which ended up being the same result. In both cases, the TCP connection
-		// is not being re-used. Actually, in the TCP mode (not http/hijacking), it is possible to re-use the connection,
-		// but it requires a decent amount of work to figure out when the request body ended.
-
-		// Does the single HTTP listener already exist?
-		forwardsLock.Lock()
-		var httpListener net.Listener
-		httpListenerObject, ok := forwards[addr]
-		if !ok {
-			var err error
-			httpListener, err = net.Listen("tcp", addr)
-			if err != nil {
-				forwardsLock.Unlock()
-				log.Fatalf("error listening for address %s: %s", addr, err)
-				return false, []byte{}
-			}
-			// Add this SSH client to the listeners list of HTTP
-			// Keep http listener available until app shuts down.
-			forwards[addr] = forwardsListenerData{listener: httpListener, conType: HTTPConnectionType}
-		} else {
-			httpListener = httpListenerObject.listener
-		}
-		forwardsLock.Unlock()
-
-		// Only execute this the first time we open an HTTP listener
-		if !ok {
-			go func() {
-				for {
-					// Accept new connections from HTTP here
-					httpConnection, err := httpListener.Accept()
-					if err != nil {
-						select {
-						case <-cancellationCtx.Done():
-							log.Println("Http listener: Cancellation requested")
-							return
-						default:
-						}
-						log.Printf("error accepting new HTTP connections at %s: %s", httpListener.Addr(), err)
-						continue
-					}
-
-					go handleHttpConnection(httpConnection, addr)
-				}
-			}()
+		// Ensure a shared http.Server exists for this bind address. The server
+		// routes requests by tunnelName (subdomain or URL path) and forwards
+		// them through an httputil.ReverseProxy whose Transport opens a new
+		// SSH forwarded-tcpip channel per dial.
+		httpListener, err := ensureHTTPServer(addr, cancellationCtx)
+		if err != nil {
+			log.Fatalf("error listening for address %s: %s", addr, err)
+			return false, []byte{}
 		}
 
-		// Local listening address on server (eg localhost:80)
 		_, destPortStr, _ := net.SplitHostPort(httpListener.Addr().String())
 		destPort, _ := strconv.Atoi(destPortStr)
 
 		return true, ssh.Marshal(&remoteForwardSuccess{uint32(destPort)})
-	} else {
+	}
 
-		var ln net.Listener
-		var err error
-		forwardsLock.Lock()
-		// If port already taken and is the same client, take over.
-		requestBindPort := int(reqPayload.BindPort)
+	// TCP mode (unchanged).
+	var ln net.Listener
+	var err error
+	forwardsLock.Lock()
+	requestBindPort := int(reqPayload.BindPort)
 
-		// 0 means allocate a random port
-		if requestBindPort == 0 {
-			// Find the 1st available port above 1000
-			for p := 1000; p <= 1<<16; p++ {
-				addr = net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(p))
-				if _, ok := forwards[addr]; !ok {
-					requestBindPort = p
-					reqPayload.BindPort = uint32(p)
-					break
-				}
+	// 0 means allocate a random port
+	if requestBindPort == 0 {
+		for p := 1000; p <= 1<<16; p++ {
+			addr = net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(p))
+			if _, ok := forwards[addr]; !ok {
+				requestBindPort = p
+				reqPayload.BindPort = uint32(p)
+				break
 			}
 		}
+	}
 
-		o, ok := forwards[addr]
-		if !ok || o.clientID == clientID {
-			// Port not taken by taken same client
-			// create a new listener
-			if o.clientID == clientID {
-				log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
-				o.listener.Close()
-			}
+	o, ok := forwards[addr]
+	if !ok || o.clientID == clientID {
+		if o.clientID == clientID {
+			log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
+			o.listener.Close()
+		}
 
-			ln, err = net.Listen("tcp", addr)
-			if err != nil {
-				log.Printf("error listening for TCP address %s: %s", addr, err)
-				forwardsLock.Unlock()
-				return false, []byte{}
-			}
-			forwards[addr] = forwardsListenerData{listener: ln, clientID: clientID, sessionID: hex.EncodeToString(conn.SessionID()), conType: TCPConnectionType}
-		} else {
-			// Port taken
-			io.WriteString(session.channel, fmt.Sprintf("TCP port %d is already taken.\n", reqPayload.BindPort))
+		ln, err = net.Listen("tcp", addr)
+		if err != nil {
+			log.Printf("error listening for TCP address %s: %s", addr, err)
 			forwardsLock.Unlock()
 			return false, []byte{}
 		}
+		forwards[addr] = forwardsListenerData{listener: ln, clientID: clientID, sessionID: hex.EncodeToString(conn.SessionID()), conType: TCPConnectionType}
+	} else {
+		io.WriteString(session.channel, fmt.Sprintf("TCP port %d is already taken.\n", reqPayload.BindPort))
 		forwardsLock.Unlock()
-
-		// Write server host:port to the SSH client.
-		io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domainURI.Hostname(), requestBindPort))
-
-		go func() {
-			for {
-				// Listen to local port N (ie other than httpBindPort)
-				tcpConnection, err := ln.Accept()
-				if err != nil {
-					select {
-					case <-cancellationCtx.Done():
-						log.Println("TCP listener: Cancellation requested")
-						return
-					default:
-					}
-					log.Printf("error accepting new TCP connection at %s: %s", ln.Addr(), err)
-					break
-				}
-				_, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
-				destPort, _ := strconv.Atoi(destPortStr)
-
-				originAddr, orignPortStr, _ := net.SplitHostPort(tcpConnection.RemoteAddr().String())
-				originPort, _ := strconv.Atoi(orignPortStr)
-				payload := ssh.Marshal(&remoteForwardChannelData{
-					DestAddr:   reqPayload.BindAddr,
-					DestPort:   uint32(destPort),
-					OriginAddr: originAddr,
-					OriginPort: uint32(originPort),
-				})
-
-				go func() {
-					io.WriteString(session.channel, fmt.Sprintf("Received tcp request from %s\n", tcpConnection.RemoteAddr().String()))
-					ch, reqs, err := conn.OpenChannel(forwardedTCPChannelType, payload)
-					if err != nil {
-						log.Printf("error opening %s SSH channel: %s", forwardedTCPChannelType, err)
-						tcpConnection.Close()
-						return
-					}
-					go ssh.DiscardRequests(reqs)
-					go func() {
-						defer func() {
-							if r := recover(); r != nil {
-								log.Debugf("Recovered from %s", r)
-							}
-						}()
-
-						defer ch.Close()
-						defer tcpConnection.Close()
-						buf := bufPool.Get().(*[]byte)
-						defer bufPool.Put(buf)
-						io.CopyBuffer(ch, tcpConnection, *buf)
-					}()
-					go func() {
-						defer func() {
-							if r := recover(); r != nil {
-								log.Debugf("Recovered from %s", r)
-							}
-						}()
-
-						defer ch.Close()
-						defer tcpConnection.Close()
-						buf := bufPool.Get().(*[]byte)
-						defer bufPool.Put(buf)
-						io.CopyBuffer(tcpConnection, ch, *buf)
-					}()
-				}()
-			}
-
-			forwardsLock.Lock()
-			o, ok := forwards[addr]
-			if ok && o.sessionID == hex.EncodeToString(conn.SessionID()) {
-				log.Printf("Closing TCP listener for session %s", hex.EncodeToString(conn.SessionID()))
-				delete(forwards, addr)
-				o.listener.Close()
-			}
-			forwardsLock.Unlock()
-		}()
-
-		return true, ssh.Marshal(&remoteForwardSuccess{uint32(requestBindPort)})
-
+		return false, []byte{}
 	}
+	forwardsLock.Unlock()
 
+	io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domainURI.Hostname(), requestBindPort))
+
+	go func() {
+		for {
+			tcpConnection, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-cancellationCtx.Done():
+					log.Println("TCP listener: Cancellation requested")
+					return
+				default:
+				}
+				log.Printf("error accepting new TCP connection at %s: %s", ln.Addr(), err)
+				break
+			}
+			_, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
+			destPort, _ := strconv.Atoi(destPortStr)
+
+			originAddr, orignPortStr, _ := net.SplitHostPort(tcpConnection.RemoteAddr().String())
+			originPort, _ := strconv.Atoi(orignPortStr)
+			payload := ssh.Marshal(&remoteForwardChannelData{
+				DestAddr:   reqPayload.BindAddr,
+				DestPort:   uint32(destPort),
+				OriginAddr: originAddr,
+				OriginPort: uint32(originPort),
+			})
+
+			go func() {
+				io.WriteString(session.channel, fmt.Sprintf("Received tcp request from %s\n", tcpConnection.RemoteAddr().String()))
+				ch, reqs, err := conn.OpenChannel(forwardedTCPChannelType, payload)
+				if err != nil {
+					log.Printf("error opening %s SSH channel: %s", forwardedTCPChannelType, err)
+					tcpConnection.Close()
+					return
+				}
+				go ssh.DiscardRequests(reqs)
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Debugf("Recovered from %s", r)
+						}
+					}()
+
+					defer ch.Close()
+					defer tcpConnection.Close()
+					buf := bufPool.Get().(*[]byte)
+					defer bufPool.Put(buf)
+					io.CopyBuffer(ch, tcpConnection, *buf)
+				}()
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Debugf("Recovered from %s", r)
+						}
+					}()
+
+					defer ch.Close()
+					defer tcpConnection.Close()
+					buf := bufPool.Get().(*[]byte)
+					defer bufPool.Put(buf)
+					io.CopyBuffer(tcpConnection, ch, *buf)
+				}()
+			}()
+		}
+
+		forwardsLock.Lock()
+		o, ok := forwards[addr]
+		if ok && o.sessionID == hex.EncodeToString(conn.SessionID()) {
+			log.Printf("Closing TCP listener for session %s", hex.EncodeToString(conn.SessionID()))
+			delete(forwards, addr)
+			o.listener.Close()
+		}
+		forwardsLock.Unlock()
+	}()
+
+	return true, ssh.Marshal(&remoteForwardSuccess{uint32(requestBindPort)})
 }
 
-func handleHttpConnection(httpConnection net.Conn, addr string) {
-	httpBuf := bufPool.Get().(*[]byte)
-	defer bufPool.Put(httpBuf)
-	defer httpConnection.Close()
-	hadPreviousRequests := false
+// ensureHTTPServer returns the shared HTTP listener for addr, starting one if
+// it does not yet exist. The http.Server services all tunnels bound to addr
+// and routes per-request by tunnelName (subdomain or URL path).
+func ensureHTTPServer(addr string, cancellationCtx context.Context) (net.Listener, error) {
+	forwardsLock.Lock()
+	if existing, ok := forwards[addr]; ok {
+		forwardsLock.Unlock()
+		return existing.listener, nil
+	}
 
-	defer func() {
-		if r := recover(); r != nil {
-			log.Debugf("Recovered from error handling http connection: %s", r)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		forwardsLock.Unlock()
+		return nil, err
+	}
+	forwards[addr] = forwardsListenerData{listener: ln, conType: HTTPConnectionType}
+	forwardsLock.Unlock()
+
+	server := &http.Server{
+		Handler: newTunnelHandler(addr),
+		BaseContext: func(_ net.Listener) context.Context {
+			return cancellationCtx
+		},
+	}
+
+	go func() {
+		<-cancellationCtx.Done()
+		server.Close()
+	}()
+
+	go func() {
+		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			log.Debugf("HTTP server for %s exited: %v", addr, err)
 		}
 	}()
 
-	for {
-		log.Printf("Waiting for a new http request on TCP connection")
+	return ln, nil
+}
 
-		// TODO: Reuse httpProcessor across multiple requests on the same TCP connection
-		httpProcessor := newHttpProcessor(httpConnection, *httpBuf)
+// newTunnelHandler builds the http.Handler that dispatches to the right
+// tunnel by looking up sshTunnelListeners and forwards via httputil.ReverseProxy.
+func newTunnelHandler(addr string) http.Handler {
+	transport := &http.Transport{
+		// Reuse SSH channels across HTTP requests. sshChannelConnection
+		// implements real read/write deadlines, so IdleConnTimeout reaps
+		// stale pooled channels. Flip DisableKeepAlives=true to get a fresh channel per request.
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialSSHChannel(ctx)
+		},
+		DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			c, err := dialSSHChannel(ctx)
+			if err != nil {
+				return nil, err
+			}
+			// InsecureSkipVerify mirrors the previous behavior: user explicitly
+			// requested https, and we want self-signed upstreams to work.
+			tlsConn := tls.Client(c, &tls.Config{InsecureSkipVerify: true})
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				c.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		},
+	}
 
-		// Extract http request headers to get tunnelName
-		var tunnelName string
-		var host string
-		var path string
-		var err error
-		if domainPath {
-			path, err = httpProcessor.GetURLPath()
-		} else {
-			host, err = httpProcessor.GetHost()
-		}
-		if err != nil && hadPreviousRequests && (err == io.EOF || strings.HasSuffix(err.Error(), ": EOF") ||
-			strings.Contains(err.Error(), "use of closed network connection")) {
-			// Expected error client only wanted one request
-			log.Printf("Request TCP connection terminated")
-			return
-		}
-		log.Printf("Http request started")
+	proxy := &httputil.ReverseProxy{
+		Director:  tunnelDirector,
+		Transport: transport,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Debugf("reverse proxy error for %s: %v", r.URL.Path, err)
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		},
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tunnelName, err := resolveTunnelName(r)
 		if err != nil {
 			if domainPath {
-				log.Printf("could not find URL path: %s", err)
-				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid URL path.")
-
+				log.Printf("could not find URL path (path=%q, domainURI=%q): %s", r.URL.Path, domainURI.String(), err)
+				http.Error(w, "Could not find a valid URL path.", http.StatusBadRequest)
 			} else {
-				log.Printf("could not find Host header: %s", err)
-				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid Host.")
+				log.Printf("could not find Host header (request host=%q, domainHost=%q): %s", r.Host, domainURI.Hostname(), err)
+				http.Error(w, "Could not find a valid Host.", http.StatusBadRequest)
 			}
-			httpConnection.Close()
-
-			return
-		}
-		if domainPath {
-			tunnelName, err = extractTunnelNameFromURLPath(path, domainURI)
-
-		} else {
-			tunnelName, err = extractSubdomain(host, domainURI.Host)
-		}
-		if err != nil {
-			if domainPath {
-				log.Printf("could not find URL path: %s", err)
-				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid URL path.")
-
-			} else {
-				log.Printf("could not find Host header: %s", err)
-				io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nCould not find a valid Host.")
-			}
-			httpConnection.Close()
-
 			return
 		}
 
-		hadPreviousRequests = true
-		if _, ok := httpProcessor.GetContentLength(); !ok {
-			// Invalid content-length
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nInvalid Content-Length header.")
-			httpConnection.Close()
-
-			return
-		}
-
-		log.Printf("Incoming http request from %s", httpConnection.RemoteAddr())
-
-		log.Printf("Found tunnelName %q in http request", tunnelName)
-
-		sshClient, ok := sshTunnelListeners[addr+tunnelName]
+		sshTunnelListenersLock.Lock()
+		data, ok := sshTunnelListeners[addr+tunnelName]
+		sshTunnelListenersLock.Unlock()
 		if !ok {
 			log.Printf("no listeners found for the tunnelName %s", tunnelName)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo listeners found.")
-			httpConnection.Close()
-
+			http.Error(w, "No listeners found.", http.StatusBadRequest)
 			return
 		}
-		sessionChannel := sshClient.conn.GetSessionChannel()
-		if sessionChannel != nil {
-			io.WriteString(*sessionChannel, fmt.Sprintf("Received http request from %s\n", httpConnection.RemoteAddr().String()))
-		}
-		sshReqPayload := sshClient.reqPayload
-		if sshReqPayload == nil {
+		if data.reqPayload == nil {
 			log.Printf("no SSH clients found for the tunnelName %s", tunnelName)
-			io.WriteString(httpConnection, "HTTP/1.1 400 Bad Request\r\nContent-Type:text/html\r\n\r\nNo SSH client found.")
-			httpConnection.Close()
-
-			return
-		}
-		conn := sshClient.conn
-
-		if sshClient.hostHeader != nil {
-			log.Printf("Setting Host header to %q", *sshClient.hostHeader)
-			httpProcessor.SetHostHeader(*sshClient.hostHeader)
-		}
-
-		httpProcessor.ReadHeadersIfNeeded()
-		if httpProcessor.request {
-
-			stripUrlPrefix := ""
-			if domainPath {
-				stripUrlPrefix = domainURI.Path + "/" + tunnelName
-			}
-			newURL, _ := replaceRequestURL(httpProcessor.requestRawURI, sshClient.hostHeader, stripUrlPrefix)
-			if newURL != httpProcessor.requestRawURI {
-				log.Debugf("Adjusting http request URL from %q to %q", httpProcessor.requestRawURI, newURL)
-				httpProcessor.replaceHttpRequestURL(newURL)
-			}
-		}
-
-		originAddr, orignPortStr, _ := net.SplitHostPort(httpConnection.RemoteAddr().String())
-		originPort, _ := strconv.Atoi(orignPortStr)
-		payload := ssh.Marshal(&remoteForwardChannelData{
-			DestAddr:   sshReqPayload.BindAddr,
-			DestPort:   uint32(httpBindPort),
-			OriginAddr: originAddr,
-			OriginPort: uint32(originPort),
-		})
-
-		sshChannel, reqs, err := conn.OpenChannel(forwardedTCPChannelType, payload)
-
-		if err != nil {
-			httpConnection.Close()
-
-			log.Printf("error opening %s channel: %s", forwardedTCPChannelType, err)
+			http.Error(w, "No SSH client found.", http.StatusBadRequest)
 			return
 		}
 
-		// If the client specified "https", wrap the connection with tls.
-		// Need to wrap sshChannel with net.Conn methods.
-		var sshChannelConn net.Conn
+		log.Printf("Incoming http request from %s", r.RemoteAddr)
+		log.Printf("Found tunnelName %q in http request", tunnelName)
 
-		if sshClient.connectionType == "https" {
-			// No need to verify TLS chain as the user manually requested it and to allow self-signed certificates to work.
-			// Also, this improves performance.
-			sshChannelConn = tls.Client(newSSHChannelConnection(&sshChannel, conn.cancellationCtx), &tls.Config{InsecureSkipVerify: true})
-
-		} else {
-			// http
-			sshChannelConn = newSSHChannelConnection(&sshChannel, conn.cancellationCtx)
+		if sessionChannel := data.conn.GetSessionChannel(); sessionChannel != nil {
+			io.WriteString(*sessionChannel, fmt.Sprintf("Received http request from %s\n", r.RemoteAddr))
 		}
 
-		// Remote http connection underlying TCP socket closed remotely
-		remoteTCPConnectionClose := false
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go ssh.DiscardRequests(reqs)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Debugf("Recovered from %s", r)
-				}
-			}()
+		originAddr, originPortStr, _ := net.SplitHostPort(r.RemoteAddr)
+		originPort, _ := strconv.Atoi(originPortStr)
 
-			defer wg.Done()
-			buf := bufPool.Get().(*[]byte)
-			defer bufPool.Put(buf)
+		ctx := context.WithValue(r.Context(), ctxKeyTunnel, &data)
+		ctx = context.WithValue(ctx, ctxKeyOrigin, originInfo{addr: originAddr, port: uint32(originPort)})
+		ctx = context.WithValue(ctx, ctxKeyTunnelName, tunnelName)
 
-			n, err := io.CopyBuffer(sshChannelConn, httpProcessor.GetReader(), *buf)
-			if err != nil {
-				log.Debugf("error copying to SSH channel: %s", err)
-			}
-			log.Debugf("Copied %v bytes from http request to SSH channel", n)
+		proxy.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
-		}()
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Debugf("Recovered from %s", r)
-				}
-			}()
-
-			defer wg.Done()
-			buf := bufPool.Get().(*[]byte)
-			defer bufPool.Put(buf)
-			buf2 := bufPool.Get().(*[]byte)
-			defer bufPool.Put(buf2)
-
-			defer sshChannelConn.Close()
-			// Wrap sshChannel as well to avoid calling .Read multiple times. Otherwise, this will block.
-			sshChannelWrapper := &eofReader{r: sshChannelConn}
-			responseHttpProcessor := newHttpProcessor(sshChannelWrapper, *buf2)
-			responseHttpProcessor.requestMethod = httpProcessor.requestMethod
-			n, err := io.CopyBuffer(httpConnection, responseHttpProcessor.GetReader(), *buf)
-			if err != nil {
-				log.Debugf("error copying from SSH channel: %s", err)
-			}
-			log.Debugf("Copied %v bytes from SSH channel to http response", n)
-			remoteTCPConnectionClose = sshChannelWrapper.EOF
-			if remoteTCPConnectionClose {
-				log.Debugln("remote TCP connection closed")
-			}
-
-		}()
-		wg.Wait()
-
-		log.Printf("Http request ended")
-
-		if remoteTCPConnectionClose {
-			// Do not wait for additional incoming HTTP requests by closing client/incoming TCP connection
-			// since the destination closed their end
-			break
-		}
-		httpProcessor.Close()
+// resolveTunnelName extracts the tunnelName from either the Host header
+// (subdomain mode) or the URL path (domainPath mode).
+func resolveTunnelName(r *http.Request) (string, error) {
+	if domainPath {
+		return extractTunnelNameFromURLPath(r.URL.Path, domainURI)
 	}
+	host := r.Host
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return extractSubdomain(host, domainURI.Hostname())
+}
+
+// tunnelDirector rewrites the request before it is sent upstream. It sets the
+// URL scheme, rewrites the Host/Origin headers when the client specified a
+// custom header, and strips the tunnel prefix from the path in domainPath mode.
+func tunnelDirector(r *http.Request) {
+	data, _ := r.Context().Value(ctxKeyTunnel).(*sshTunnelsListenerData)
+	tunnelName, _ := r.Context().Value(ctxKeyTunnelName).(string)
+
+	if data == nil {
+		return
+	}
+
+	if data.connectionType == "https" {
+		r.URL.Scheme = "https"
+	} else {
+		r.URL.Scheme = "http"
+	}
+
+	if data.hostHeader != nil {
+		log.Debugf("Setting Host header to %q", *data.hostHeader)
+		r.Host = *data.hostHeader
+		r.URL.Host = *data.hostHeader
+
+		if origin := r.Header.Get("Origin"); origin != "" {
+			domainEndIndex := strings.Index(domainURL, "/")
+			if domainEndIndex == -1 {
+				domainEndIndex = len(domainURL)
+			}
+			prefix := domainURL[:domainEndIndex]
+			if strings.Contains(strings.ToLower(origin), strings.ToLower(prefix)) {
+				r.Header.Set("Origin", strings.Replace(origin, prefix, *data.hostHeader, 1))
+			}
+		}
+	} else if r.URL.Host == "" {
+		r.URL.Host = r.Host
+	}
+
+	if domainPath && tunnelName != "" {
+		stripPrefix := domainURI.Path + "/" + tunnelName
+		r.URL.Path = stripPathPrefix(r.URL.Path, stripPrefix)
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = stripPathPrefix(r.URL.RawPath, stripPrefix)
+		}
+	}
+}
+
+func stripPathPrefix(path, prefix string) string {
+	p := strings.TrimLeft(path, "/")
+	pre := strings.TrimLeft(prefix, "/")
+	p = strings.TrimPrefix(p, pre)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
+// dialSSHChannel opens a new SSH forwarded-tcpip channel on the connection
+// associated with the current request and returns it wrapped as a net.Conn.
+func dialSSHChannel(ctx context.Context) (net.Conn, error) {
+	data, ok := ctx.Value(ctxKeyTunnel).(*sshTunnelsListenerData)
+	if !ok || data == nil || data.reqPayload == nil {
+		return nil, errors.New("no tunnel data on request context")
+	}
+	origin, _ := ctx.Value(ctxKeyOrigin).(originInfo)
+
+	payload := ssh.Marshal(&remoteForwardChannelData{
+		DestAddr:   data.reqPayload.BindAddr,
+		DestPort:   uint32(httpBindPort),
+		OriginAddr: origin.addr,
+		OriginPort: origin.port,
+	})
+
+	ch, reqs, err := data.conn.OpenChannel(forwardedTCPChannelType, payload)
+	if err != nil {
+		log.Printf("error opening %s channel: %s", forwardedTCPChannelType, err)
+		return nil, err
+	}
+	go ssh.DiscardRequests(reqs)
+	return newSSHChannelConnection(&ch, data.conn.cancellationCtx), nil
 }
 
 func cancelForwardHandler(conn *sshConnection, req *ssh.Request, ctx context.Context) (bool, []byte) {
@@ -575,7 +534,6 @@ func cancelForwardHandler(conn *sshConnection, req *ssh.Request, ctx context.Con
 		return false, []byte{}
 	}
 	if reqPayload.BindPort == httpBindPort {
-		// We don't want to delete the only HTTP listener we have
 		tunnelName := conn.GetTunnelName()
 		if tunnelName != nil {
 			cacheKey := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort))) + *conn.GetTunnelName()
