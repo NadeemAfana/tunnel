@@ -131,76 +131,81 @@ func (h *httpProcessor) Read(p []byte) (n int, err error) {
 	// Read and parse headers first.
 	// Look for the first \r\n\r\n instance
 	if !h.bufferUsed {
-		if !h.parsedHeaders && h.bufReadPos == h.bufWritePos {
-			h.bufReadPos = 0
-			h.bufWritePos = 0
+		if !h.parsedHeaders {
+			// Keep reading from the underlying reader until we find the
+			// end-of-headers delimiter or we fill the buffer. A single Read
+			// is not sufficient: the underlying reader (especially an SSH
+			// channel) may legitimately split HTTP headers across multiple
+			// Reads, in which case parsing would spuriously fail.
+			delimiter := []byte("\r\n\r\n")
+			delimiterIndex := bytes.Index(h.buf[:h.bufWritePos], delimiter)
+			for delimiterIndex < 0 && h.bufWritePos < len(h.buf) {
+				nr, rerr := h.reader.Read(h.buf[h.bufWritePos:])
+				if nr > 0 {
+					h.bufWritePos += nr
+					h.totalBytes += int64(nr)
+					h.bufferBytesRead += int64(nr)
+					delimiterIndex = bytes.Index(h.buf[:h.bufWritePos], delimiter)
+				}
+				if rerr != nil {
+					h.lastError = rerr
+					break
+				}
+			}
 
-			n, err := h.reader.Read(h.buf)
+			h.request = false
+			firstLineEndPos := bytes.Index(h.buf[:h.bufWritePos], []byte("\r\n"))
+			if firstLineEndPos < 0 {
+				if h.lastError == nil {
+					h.lastError = errors.New("could not find the http status line within the allocated buffer")
+				}
+				return 0, h.lastError
+			}
+			if delimiterIndex < 0 {
+				if h.lastError == nil {
+					h.lastError = errors.New("could not Read the headers within the allocated buffer")
+				}
+				return 0, h.lastError
+			}
+
+			h.bodyStartsIndex = delimiterIndex + 4
+			reader := bufio.NewReader(bytes.NewReader(h.buf[firstLineEndPos+2 : delimiterIndex+4]))
+			tp := textproto.NewReader(reader)
+
+			mimeHeader, err := tp.ReadMIMEHeader()
 			if err != nil {
 				h.lastError = err
-				return n, h.lastError
+				return 0, err
 			}
-			h.totalBytes += int64(n)
-			h.bufferBytesRead += h.totalBytes
 
-			h.bufWritePos += n
-		}
-
-		if !h.parsedHeaders {
-			h.request = false
-			// Find headers delimiter
-			// Give up if it's not in the buffer.
-			firstLineEndPos := bytes.Index(h.buf, []byte("\r\n"))
-			if firstLineEndPos < 0 {
-				h.lastError = errors.New("could not find the  http status line within the allocated buffer")
-				return 0, h.lastError
-			}
-			delimiter := []byte("\r\n\r\n")
-			delimiterIndex := bytes.Index(h.buf, delimiter)
-			if delimiterIndex > 0 {
-				h.bodyStartsIndex = delimiterIndex + 4
-				reader := bufio.NewReader(bytes.NewReader(h.buf[firstLineEndPos+2 : delimiterIndex+4]))
-				tp := textproto.NewReader(reader)
-
-				mimeHeader, err := tp.ReadMIMEHeader()
-				if err != nil {
-					h.lastError = err
-					return 0, err
-				}
-
-				// Assume this is a request, not response to get the URL.
-				line := string(h.buf[0:firstLineEndPos])
-				if method, requestURI, _, ok := h.parseRequestLine(line); ok {
-					if h.validMethod(method) {
-						// This is a request at this point
-						h.request = true
-						h.requestMethod = method
-						h.requestRawURI = requestURI
-						if u, err := url.ParseRequestURI(requestURI); err == nil {
-							h.URL = u
-						}
+			// Assume this is a request, not response to get the URL.
+			line := string(h.buf[0:firstLineEndPos])
+			if method, requestURI, _, ok := h.parseRequestLine(line); ok {
+				if h.validMethod(method) {
+					// This is a request at this point
+					h.request = true
+					h.requestMethod = method
+					h.requestRawURI = requestURI
+					if u, err := url.ParseRequestURI(requestURI); err == nil {
+						h.URL = u
 					}
 				}
-
-				if !h.request {
-					if _, _, responseStatusCode, ok := h.parseResponseLine(line); ok {
-						h.responseStatusCode = responseStatusCode
-						h.request = false
-					}
-				}
-
-				h.headers = mimeHeader
-				h.parsedHeaders = true
-
-				// headers end here
-				// Wrap HTTP request with a reader that limits the size of data Read from the body
-				h.GetContentLength()
-				h.adjustBodyReader()
-
-			} else {
-				h.lastError = errors.New("could not Read the headers within the allocated buffer")
-				return 0, h.lastError
 			}
+
+			if !h.request {
+				if _, _, responseStatusCode, ok := h.parseResponseLine(line); ok {
+					h.responseStatusCode = responseStatusCode
+					h.request = false
+				}
+			}
+
+			h.headers = mimeHeader
+			h.parsedHeaders = true
+
+			// headers end here
+			// Wrap HTTP request with a reader that limits the size of data Read from the body
+			h.GetContentLength()
+			h.adjustBodyReader()
 		}
 
 		if len(p) == 0 {
@@ -466,8 +471,25 @@ func (h *httpProcessor) GetContentLength() (int64, bool) {
 }
 
 func (h *httpProcessor) GetReader() io.Reader {
-	h.ReadHeadersIfNeeded()
+	if err := h.ReadHeadersIfNeeded(); err != nil || h.headerBodyReader == nil {
+		// Never return a nil reader: callers use io.CopyBuffer, which would
+		// panic on a nil src. Surface the real error (or a generic EOF) so
+		// callers can log it and close the downstream connection cleanly.
+		return &errReader{err: h.lastError}
+	}
 	return h.headerBodyReader
+}
+
+// errReader is an io.Reader that always returns a fixed error (or io.EOF if
+// err is nil). Used as a defensive return value from GetReader so we never
+// hand a nil reader to io.CopyBuffer.
+type errReader struct{ err error }
+
+func (e *errReader) Read(_ []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	return 0, io.EOF
 }
 
 // TODO: Minimize calls to this function
