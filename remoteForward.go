@@ -125,37 +125,33 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 
 		var err error
 		tunnelNameTakenOrInvalid := false
+		requestedTunnelName := tunnelName
+		var sameClientReuse, takenByOtherClient bool
 
 		sshTunnelListenersLock.Lock()
 		if tunnelNameValid {
-			s, ok := sshTunnelListeners[addr+tunnelName]
-			if ok && s.clientID == clientID {
-				log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
-				tunnelNameTakenOrInvalid = false
-			} else if ok && s.clientID != clientID {
-				tunnelNameTakenOrInvalid = true
-				io.WriteString(session.channel, fmt.Sprintf("Specified tunnelName '%s' already taken\n", tunnelName))
+			if s, ok := sshTunnelListeners[addr+tunnelName]; ok {
+				if s.clientID == clientID {
+					sameClientReuse = true
+				} else {
+					takenByOtherClient = true
+					tunnelNameTakenOrInvalid = true
+				}
 			}
 		} else {
 			tunnelNameTakenOrInvalid = true
 		}
 
-		for {
-			if tunnelNameTakenOrInvalid {
-				tunnelName, err = generateRandomTunnelName()
-				if err != nil {
-					log.Printf("error generating tunnelName: %s", err)
-					return false, []byte("error generating tunnelName")
-				}
-				_, tunnelNameTakenOrInvalid = sshTunnelListeners[addr+tunnelName]
-			} else {
-				break
+		for tunnelNameTakenOrInvalid {
+			tunnelName, err = generateRandomTunnelName()
+			if err != nil {
+				sshTunnelListenersLock.Unlock()
+				log.Printf("error generating tunnelName: %s", err)
+				return false, []byte("error generating tunnelName")
 			}
+			_, tunnelNameTakenOrInvalid = sshTunnelListeners[addr+tunnelName]
 		}
 
-		log.Printf("using tunnelName %s", tunnelName)
-
-		conn.SetTunnelName(tunnelName)
 		sshListenerData := sshTunnelsListenerData{
 			conn:           conn,
 			reqPayload:     &reqPayload,
@@ -167,10 +163,18 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		if headerSpecified {
 			sshListenerData.hostHeader = &header
 		}
-
 		sshTunnelListeners[addr+tunnelName] = sshListenerData
-
 		sshTunnelListenersLock.Unlock()
+
+		// Side effects now that the critical section is released.
+		if sameClientReuse {
+			log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
+		}
+		if takenByOtherClient {
+			io.WriteString(session.channel, fmt.Sprintf("Specified tunnelName '%s' already taken\n", requestedTunnelName))
+		}
+		log.Printf("using tunnelName %s", tunnelName)
+		conn.SetTunnelName(tunnelName)
 
 		if domainPath {
 			io.WriteString(session.channel, fmt.Sprintf("%s/%s\n", domainURL, tunnelName))
@@ -402,9 +406,9 @@ func newTunnelHandler(addr string) http.Handler {
 			return
 		}
 
-		sshTunnelListenersLock.Lock()
+		sshTunnelListenersLock.RLock()
 		data, ok := sshTunnelListeners[addr+tunnelName]
-		sshTunnelListenersLock.Unlock()
+		sshTunnelListenersLock.RUnlock()
 		if !ok {
 			log.Printf("no listeners found for the tunnelName %s", tunnelName)
 			http.Error(w, "No listeners found.", http.StatusBadRequest)

@@ -39,7 +39,7 @@ const cancelForwardTCPRequestType = "cancel-tcpip-forward"
 
 // Represents tunnels: SSH connections filtered by localhost binding port+subdomain (:80+subdomain)
 var sshTunnelListeners map[string]sshTunnelsListenerData
-var sshTunnelListenersLock sync.Mutex
+var sshTunnelListenersLock sync.RWMutex
 var forwards map[string]forwardsListenerData
 var forwardsLock sync.Mutex
 
@@ -222,11 +222,11 @@ func main() {
 	}
 	forwardsLock.Unlock()
 
-	sshTunnelListenersLock.Lock()
+	sshTunnelListenersLock.RLock()
 	for _, tunnel := range sshTunnelListeners {
 		tunnel.conn.Close()
 	}
-	sshTunnelListenersLock.Unlock()
+	sshTunnelListenersLock.RUnlock()
 
 	log.Infoln("Server exiting")
 }
