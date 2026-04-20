@@ -156,7 +156,7 @@ func main() {
 
 	log.Println("Listening for SSH connections at", ":"+strconv.Itoa(sshPort))
 	// Wait for interrupt signal to gracefully shut down the server
-	quit := make(chan os.Signal)
+	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
 	// Accept incoming SSH connections
