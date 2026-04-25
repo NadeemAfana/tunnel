@@ -362,7 +362,7 @@ func TestHTTPTunnel_HostHeaderRewrite(t *testing.T) {
 
 	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", tc.bindPort), nil)
 	req.Host = "hello.test.localhost"
-	req.Header.Set("Origin", "http://test.localhost")
+	req.Header.Set("Origin", "http://hello.test.localhost")
 	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 	if err != nil {
 		t.Fatalf("do: %v", err)
@@ -374,11 +374,8 @@ func TestHTTPTunnel_HostHeaderRewrite(t *testing.T) {
 	if gotHost != "internal.svc" {
 		t.Fatalf("expected upstream Host=internal.svc, got %q", gotHost)
 	}
-	// Origin rewrite replaces the domainURL prefix ("http:") with the header
-	// value - see SetHostHeader logic preserved in tunnelDirector. We just
-	// assert the header was touched (original was "http://test.localhost").
-	if gotOrigin == "http://test.localhost" {
-		t.Fatalf("Origin was not rewritten: %q", gotOrigin)
+	if gotOrigin != "http://internal.svc" {
+		t.Fatalf("expected upstream Origin=http://internal.svc, got %q", gotOrigin)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -474,13 +475,8 @@ func tunnelDirector(r *http.Request) {
 		r.URL.Host = *data.hostHeader
 
 		if origin := r.Header.Get("Origin"); origin != "" {
-			domainEndIndex := strings.Index(domainURL, "/")
-			if domainEndIndex == -1 {
-				domainEndIndex = len(domainURL)
-			}
-			prefix := domainURL[:domainEndIndex]
-			if strings.Contains(strings.ToLower(origin), strings.ToLower(prefix)) {
-				r.Header.Set("Origin", strings.Replace(origin, prefix, *data.hostHeader, 1))
+			if originURL, err := url.Parse(origin); err == nil && originURL.Host != "" {
+				r.Header.Set("Origin", r.URL.Scheme+"://"+*data.hostHeader)
 			}
 		}
 	} else if r.URL.Host == "" {
