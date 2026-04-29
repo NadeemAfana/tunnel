@@ -62,7 +62,135 @@ printHelp () {
   printf "  UDP tunnels need the udp-bridge helper binary. By default it is cached at\n"
   printf "  \$HOME/.tunnel/udp-bridge. It will be automatically downloaded if not present.\n"
   printf "  Override the binary path via \$UDP_BRIDGE_BIN to use a custom location.\n"
+
+  printf '\nAdmin mode\n'
+  printf "  Manage the server's authorized keys at runtime (no restart required).\n"
+  printf "  Any authenticated key may invoke admin commands as long as the operator\n"
+  printf "  knows the admin passphrase.\n\n"
+  printf "  %-32s List currently authorized keys.\n" "tunnel.sh admin list"
+  printf "  %-32s Add a key (requires --pubkey FILE).\n" "tunnel.sh admin add NAME"
+  printf "  %-32s Remove an authorized key by name.\n" "tunnel.sh admin remove NAME"
+  printf "\n"
+  printf "  Admin subcommand flags:\n"
+  printf "  %-25s OpenSSH-format public key file to add (required for 'add').\n" "--pubkey FILE"
+  printf "  %-25s SSH identity file used to authenticate to the server\n" "-k, --key FILE"
+  printf "  %-25s (passed through as ssh -i FILE).\n"
+  printf "\n"
+  printf "  Passphrase is read from \$TUNNEL_ADMIN_PASSPHRASE if set, otherwise\n"
+  printf "  prompted silently on the controlling terminal. It is sent on the first\n"
+  printf "  stdin line of the SSH exec so it never appears in the process list or\n"
+  printf "  shell history. Server must have admin_passphrase_bcrypt configured.\n"
 }
+
+# --- Admin mode --------------------------------------------------------------
+# Usage:
+#   tunnel.sh admin list
+#   tunnel.sh admin add NAME --pubkey FILE [-k KEYFILE]
+#   tunnel.sh admin remove NAME [-k KEYFILE]
+#
+# Passphrase is read from $TUNNEL_ADMIN_PASSPHRASE if set, otherwise prompted
+# silently on the controlling terminal. The passphrase is sent on the first
+# stdin line of the SSH exec; for `add`, the public key is sent on the second
+# line. Nothing is echoed to the terminal or saved to shell history.
+#
+if [[ "$1" = "admin" ]]; then
+  shift
+  if [[ ! $TUNNEL_DOMAIN ]]; then
+    echo '$TUNNEL_DOMAIN is required.' >&2
+    exit 1
+  fi
+  if [[ -z "$1" ]]; then
+    echo "usage: tunnel.sh admin <list|add NAME|remove NAME> [-k KEYFILE] [--pubkey FILE]" >&2
+    exit 1
+  fi
+
+  adminSubcommand="$1"; shift
+  adminName=""
+  adminPubkeyFile=""
+  adminKeyFile=""
+
+  case "$adminSubcommand" in
+    list)
+      ;;
+    add|remove)
+      if [[ -z "${1:-}" || "${1:-}" = -* ]]; then
+        echo "tunnel.sh admin $adminSubcommand: NAME is required" >&2
+        exit 1
+      fi
+      adminName="$1"; shift
+      ;;
+    *)
+      echo "unknown admin subcommand '$adminSubcommand' (expected list, add, remove)" >&2
+      exit 1
+      ;;
+  esac
+
+  while [ "$1" != "" ]; do
+    case "$1" in
+      -k|--key)       shift; adminKeyFile="$1" ;;
+      --pubkey)       shift; adminPubkeyFile="$1" ;;
+      *)              echo "tunnel.sh admin: unexpected argument '$1'" >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  if [[ -n "${TUNNEL_ADMIN_PASSPHRASE:-}" ]]; then
+    adminPass="$TUNNEL_ADMIN_PASSPHRASE"
+  else
+    # Silent read from the controlling tty so the passphrase is not captured
+    # by shell history, process listings, or pipe redirections.
+    if [[ ! -t 0 ]]; then
+      echo 'passphrase prompt requires a tty; set $TUNNEL_ADMIN_PASSPHRASE instead' >&2
+      exit 1
+    fi
+    read -rsp "Admin passphrase: " adminPass </dev/tty
+    echo >&2
+  fi
+  if [[ -z "${adminPass:-}" ]]; then
+    echo "passphrase is empty" >&2
+    exit 1
+  fi
+
+  adminPubkey=""
+  if [[ "$adminSubcommand" = "add" ]]; then
+    if [[ -z "$adminPubkeyFile" ]]; then
+      echo "tunnel.sh admin add: --pubkey FILE is required" >&2
+      exit 1
+    fi
+    if [[ ! -r "$adminPubkeyFile" ]]; then
+      echo "cannot read public key file: $adminPubkeyFile" >&2
+      exit 1
+    fi
+    adminPubkey="$(cat "$adminPubkeyFile")"
+    if [[ -z "$adminPubkey" ]]; then
+      echo "public key file is empty: $adminPubkeyFile" >&2
+      exit 1
+    fi
+  fi
+
+  # Build ssh args as an array so paths/values containing whitespace survive
+  # word splitting on both bash 3.2 (macOS) and modern bash.
+  adminSshArgs=(-o ConnectionAttempts=3 -o "PubkeyAcceptedKeyTypes=+ssh-rsa" -p "$sshPort")
+  if [[ -n "$adminKeyFile" ]]; then
+    adminSshArgs+=(-i "$adminKeyFile")
+  fi
+
+  case "$adminSubcommand" in
+    list)
+      printf '%s\n' "$adminPass" | ssh "${adminSshArgs[@]}" "$USER@$TUNNEL_DOMAIN" "tunnel-admin list"
+      exit $?
+      ;;
+    add)
+      printf '%s\n%s\n' "$adminPass" "$adminPubkey" | ssh "${adminSshArgs[@]}" "$USER@$TUNNEL_DOMAIN" "tunnel-admin add $adminName"
+      exit $?
+      ;;
+    remove)
+      printf '%s\n' "$adminPass" | ssh "${adminSshArgs[@]}" "$USER@$TUNNEL_DOMAIN" "tunnel-admin remove $adminName"
+      exit $?
+      ;;
+  esac
+fi
+# -----------------------------------------------------------------------------
 
 tunnelName="$USER"                  # default tunnelName is the name of the current user
 localHostPort="localhost:3000"      # default local (host) and http/tcp port

@@ -14,7 +14,28 @@ The tool supports the following features:
 
 # Server Setup
 1. Create an `ssh_host_key_enc` env variable that contains the base64 value of the SSH host-specific private key which is used to identify the host. You can generate a new key using the command `ssh-keygen -t ecdsa -f /tmp/ssh` to generate the file and then base64 encode it `cat /tmp/ssh | base64 -w 0`.
-1. Create an `authorized_keys_enc` env variable which is the base64 value of the list of all client public SSH keys (each key separated by line feed. The key format is SHA256. See https://tools.ietf.org/html/rfc4648#section-3.2).  Each client that wants to connect must have their public key added to a whitelist list. 
+1. Create an authorized keys JSON file and pass its path to the server with `--authorizedKeysFile=/etc/tunnel/authorized_keys.json`. Each client that wants to connect must have their public key added to this file. The format is:
+
+    ```json
+    {
+      "keys": [
+        { "name": "alice", "publicKey": "ssh-ed25519 AAAA... alice@example.com" },
+        { "name": "bob",   "publicKey": "ssh-rsa AAAA... bob" }
+      ]
+    }
+    ```
+
+    The `name` is used in server logs to identify which client connected. The `publicKey` is the same single-line format you would put in an OpenSSH `authorized_keys` file.
+1. (Optional) Enable runtime admin commands so authorized keys can be added or removed without restarting the server. Generate a bcrypt hash of an admin passphrase using the tunnel binary itself (no external tools required) and set it as `admin_passphrase_bcrypt`:
+
+    ```
+    read -rs -p 'Admin passphrase: ' p; echo
+    echo -n "$p" | ./tunnel --genAdminHash
+    # copy the printed $2a$12$... hash into the env var
+    export admin_passphrase_bcrypt='$2a$12$...'
+    ```
+
+    If `admin_passphrase_bcrypt` is unset, the server logs `Admin commands disabled` on startup and rejects any admin request. See [Managing Authorized Keys at Runtime](#managing-authorized-keys-at-runtime) below for the client commands.
 1. The tunnel requires a **DNS domain** to work. The domain and all subdomains must point to the server for the http tunnel to work unless the option `--domainPath` is used. 
 The app will assign a unique subdomain for each HTTP client. For example, if your DNS domain is  `abc.io`, then `x.abc.io` and all subdomains (ie `*.abc.io`) must point to the server.
 1. The following TCP ports must be open on the server
@@ -24,13 +45,18 @@ The app will assign a unique subdomain for each HTTP client. For example, if you
 2. Run the server 
     ```
     CGO_ENABLED=0 go build
-    ./tunnel --domainUrl=https://mydomain.io
+    ./tunnel --domainUrl=https://mydomain.io --authorizedKeysFile=/etc/tunnel/authorized_keys.json
     ```
 
-    For Docker
+    For Docker (multi-stage build - no host Go toolchain required; mount the keys file into the container)
     ```
      docker build . -t=tunnel
-     docker run -p 80:80 -p 5223:5223 -e authorized_keys_enc='cfhJklQ=' -e ssh_host_key_enc='LS0tCg==' tunnel
+     docker run -p 80:80 -p 5223:5223 \
+       -e ssh_host_key_enc='LS0tCg==' \
+       -v /etc/tunnel/authorized_keys.json:/etc/tunnel/authorized_keys.json:ro \
+       tunnel \
+         --domainUrl=https://mydomain.io \
+         --authorizedKeysFile=/etc/tunnel/authorized_keys.json
 
     ```
 
@@ -43,7 +69,7 @@ First store the domain in a global variable (You can add this to the shell start
 export TUNNEL_DOMAIN=mydomain.io
 ```
 
-Second, add the client public SSH key to the server `authorized_keys_enc` env variable.
+Second, add the client public SSH key as a new entry in the server's authorized keys JSON file (the one passed via `--authorizedKeysFile`).
 
 If you cannot use subdomains, a single domain can be used for all users using a URL path. For example, to create an HTTP tunnel at local port 3000 (`https://mydomain.io/username` points to `http://localhost:3000`):
 
@@ -87,6 +113,38 @@ Create a UDP tunnel at local port 5353 and remote port 5354.
 tunnel.sh udp  5353 -p 5354
 ```
 
+## Managing Authorized Keys at Runtime
+
+Once the server is running with `admin_passphrase_bcrypt` set, any client whose key is currently authorized can add or remove keys without a server restart. Changes are applied to the in-memory list immediately and survive only until the next restart - to make them permanent, copy the JSON snippet emitted in the server log into [authorized_keys.json](authorized_keys.json).
+
+The admin passphrase is read silently from the controlling terminal, or from the `TUNNEL_ADMIN_PASSPHRASE` env var if set. It is sent on the first stdin line of the SSH exec - never on the command line, so it does not appear in process listings or shell history.
+
+List all currently authorized keys:
+```
+tunnel.sh admin list
+```
+
+Add a new key (the public-key file is the same single-line OpenSSH format as `~/.ssh/id_ed25519.pub`):
+```
+tunnel.sh admin add bob --pubkey ~/keys/bob.pub
+```
+
+Remove a key by name:
+```
+tunnel.sh admin remove bob
+```
+
+Specify a non-default identity file with `-k`:
+```
+tunnel.sh admin list -k ~/.ssh/admin_id_ed25519
+```
+
+Each successful mutation produces a `WARNING`-level log line on the server containing the calling key's name, the affected key's name, the SHA256 fingerprint, and the exact JSON entry to add to (or remove from) `authorized_keys.json`. Failed attempts (wrong passphrase) are also logged so the operator can spot brute-force attempts.
+
+Two safety rails are enforced:
+- A key cannot remove itself (would lock the caller out).
+- Names and public keys must be unique - adding a duplicate is rejected.
+
 UDP mode requires a small helper binary (`udp-bridge`) on the client. By default `tunnel.sh` looks for it at `$HOME/.tunnel/udp-bridge` (`.exe` on Windows). To enable auto-download, set `TUNNEL_BRIDGE_URL` with `{os}` / `{arch}` placeholders pointing at your release assets:
 
 ```
@@ -112,8 +170,8 @@ For more info
 tunnel.sh --help
 ```
 
-# Unit Tests
-To run the unit tests
+# Tests
+To run the tests
 ```
 go test
 ```

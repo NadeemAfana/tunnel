@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"golang.org/x/crypto/ssh"
 )
 

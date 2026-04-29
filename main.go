@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -13,14 +14,22 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 )
+
+type authorizedKeyEntry struct {
+	Name      string `json:"name"`
+	PublicKey string `json:"publicKey"`
+}
+
+type authorizedKeysFile struct {
+	Keys []authorizedKeyEntry `json:"keys"`
+}
 
 // DNS domainURL. This might include a path but only when domainPath is true.
 // This will be used for both TCP and HTTP tunnels. For TCP, the host name part is used.
@@ -43,9 +52,20 @@ var sshTunnelListenersLock sync.RWMutex
 var forwards map[string]forwardsListenerData
 var forwardsLock sync.Mutex
 
+// Authorized client SSH public keys, in-memory. Key is the marshaled wire-format
+// of the public key (pubKey.Marshal()), value is the display name. Mutated at
+// runtime by the admin command channel; protected by authorizedKeysLock.
+var authorizedKeys map[string]string
+var authorizedKeysLock sync.RWMutex
+
+// bcrypt hash of the admin passphrase, loaded from the admin_passphrase_bcrypt
+// env var. If empty, admin commands are disabled.
+var adminPassphraseHash []byte
+
 func init() {
 	forwards = make(map[string]forwardsListenerData)
 	sshTunnelListeners = make(map[string]sshTunnelsListenerData)
+	authorizedKeys = make(map[string]string)
 }
 
 func main() {
@@ -56,6 +76,9 @@ func main() {
 	// --domainPath=true or --domainPath
 	domainPathPtr := flag.Bool("domainPath", false, "Instead of subdomains, use a URL query path for user tunnels.")
 
+	// --authorizedKeysFile=/etc/tunnel/authorized_keys.json
+	authorizedKeysFilePtr := flag.String("authorizedKeysFile", "", "Path to a JSON file listing authorized client public keys. Required.")
+
 	// --log=info
 	logPtr := flag.String("log", "info", "Log level: debug, info, warn, or error.")
 
@@ -63,7 +86,17 @@ func main() {
 	// Spin up pprof endpoints at port 6060
 	pprofPtr := flag.Int("pprof", 0, "port number to spin up pprof endpoints for. Useful for debugging and troubleshooting.")
 
+	// --genAdminHash: utility mode. Reads a passphrase from stdin, prints the
+	// bcrypt hash, and exits. Used to bootstrap the admin_passphrase_bcrypt
+	// env var without external tools.
+	genAdminHashPtr := flag.Bool("genAdminHash", false, "Read a passphrase from stdin, print its bcrypt hash, and exit. Used once to bootstrap admin_passphrase_bcrypt.")
+
 	flag.Parse()
+
+	if *genAdminHashPtr {
+		runGenAdminHash()
+		return
+	}
 
 	if domainPtr == nil || *domainPtr == "" {
 		log.Fatalln("DNS domain is empty.")
@@ -80,9 +113,6 @@ func main() {
 		domainPath = *domainPathPtr
 	}
 
-	// For local development
-	godotenv.Load("secrets.env")
-
 	log.SetOutput(os.Stdout)
 
 	logLevel, err := log.ParseLevel(*logPtr)
@@ -91,41 +121,61 @@ func main() {
 	}
 	log.SetLevel(logLevel)
 
-	var authorizedKeysBytes []byte
-	if os.Getenv("authorized_keys_enc") != "" {
-		authorizedKeysBytes, err = base64.StdEncoding.DecodeString(os.Getenv("authorized_keys_enc"))
+	if authorizedKeysFilePtr == nil || *authorizedKeysFilePtr == "" {
+		log.Fatalln("--authorizedKeysFile is required")
 	}
+
+	authorizedKeysData, err := os.ReadFile(*authorizedKeysFilePtr)
 	if err != nil {
-		log.Fatalf("Failed to parse authorized_keys_enc env variable, err: %v", err)
+		log.Fatalf("Failed to read authorized keys file %q: %v", *authorizedKeysFilePtr, err)
+	}
+
+	var keysFile authorizedKeysFile
+	if err := json.Unmarshal(authorizedKeysData, &keysFile); err != nil {
+		log.Fatalf("Failed to parse authorized keys file %q: %v", *authorizedKeysFilePtr, err)
 	}
 
 	cancellationCtx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
 
-	// Public key authentication is done by comparing
-	// the public key of a received connection
-	// with the entries in the authorized_keys_enc.
-
-	authorizedKeysMap := map[string]bool{}
-	for len(authorizedKeysBytes) > 0 {
-		pubKey, _, _, rest, err := ssh.ParseAuthorizedKey(authorizedKeysBytes)
-		if err != nil {
-			log.Fatal(err)
+	// Public key authentication compares the public key of a received
+	// connection against the entries loaded from --authorizedKeysFile.
+	// Map value is the entry's name, used for logging.
+	authorizedKeysLock.Lock()
+	for _, entry := range keysFile.Keys {
+		if entry.PublicKey == "" {
+			log.Fatalf("Authorized keys file entry %q has empty publicKey", entry.Name)
 		}
+		pubKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(entry.PublicKey))
+		if err != nil {
+			log.Fatalf("Failed to parse public key for entry %q: %v", entry.Name, err)
+		}
+		authorizedKeys[string(pubKey.Marshal())] = entry.Name
+	}
+	authorizedKeysLock.Unlock()
 
-		authorizedKeysMap[string(pubKey.Marshal())] = true
-		authorizedKeysBytes = rest
+	// Optional bcrypt hash of the admin passphrase. If unset, admin commands
+	// are rejected at runtime.
+	if hash := os.Getenv("admin_passphrase_bcrypt"); hash != "" {
+		adminPassphraseHash = []byte(hash)
+		log.Printf("Admin commands enabled (passphrase hash loaded)")
+	} else {
+		log.Printf("Admin commands disabled (admin_passphrase_bcrypt env var not set)")
 	}
 
 	// An SSH server is represented by a ServerConfig, which holds
 	// certificate details and handles authentication of ServerConns.
 	config := &ssh.ServerConfig{
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
-			if authorizedKeysMap[string(pubKey.Marshal())] {
+			authorizedKeysLock.RLock()
+			name, ok := authorizedKeys[string(pubKey.Marshal())]
+			authorizedKeysLock.RUnlock()
+			if ok {
 				return &ssh.Permissions{
-					// Record the public key used for authentication.
+					// Record the public key and entry name used for authentication.
 					Extensions: map[string]string{
 						"pubkey-fp": ssh.FingerprintSHA256(pubKey),
+						"key-name":  name,
 					},
 				}, nil
 			}
@@ -241,7 +291,7 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 		// Logging would be too noisy on the server
 		return
 	}
-	log.Printf("logged in with key %s and session %s", conn.Permissions.Extensions["pubkey-fp"], hex.EncodeToString(conn.SessionID()))
+	log.Printf("logged in as %q with key %s and session %s", conn.Permissions.Extensions["key-name"], conn.Permissions.Extensions["pubkey-fp"], hex.EncodeToString(conn.SessionID()))
 
 	serverConnection := newSSHConnection(conn, cancellationCtx)
 
@@ -289,32 +339,35 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 	go handleGlobalRequests(reqs, serverConnection, execRequestCompleted, cancellationCtx)
 
 	go func() {
-		// Keepalive
-		// Send to client keepalive SSH requests
-		missingReplies := 0
+		// Keepalive: send periodic SSH requests to detect dead connections.
+		// All state mutation happens on this single goroutine — no shared
+		// counter, no nested goroutines — so there is no data race and the
+		// "N consecutive missed replies" semantic is enforced correctly even
+		// when a slow reply arrives after several ticks.
+		missing := 0
 		ticker := time.NewTicker(clientKeepaliveInterval)
 		defer ticker.Stop()
 		for {
 			select {
+			case <-cancellationCtx.Done():
+				return
 			case <-ticker.C:
-				if missingReplies >= clientKeepaliveMaxCount {
+				if missing >= clientKeepaliveMaxCount {
 					log.Printf("Did not receive keepalive replies, closing session %s", hex.EncodeToString(conn.SessionID()))
-					err := conn.Close()
-					if err != nil {
-						log.Debugf("error closing session %s: %s\n", hex.EncodeToString(conn.SessionID()), err)
+					if err := conn.Close(); err != nil {
+						log.Debugf("error closing session %s: %s", hex.EncodeToString(conn.SessionID()), err)
 					}
 					return
 				}
-				missingReplies = missingReplies + 1
-				go func() {
-					// SendRequest is synchronous we don't wait on it since it can take a long time.
-					_, _, err := conn.SendRequest("keepalive@domain.io", true, nil)
-					if err == nil {
-						// Reset count
-						missingReplies = 0
-					}
-				}()
-
+				// SendRequest blocks until the client replies (or the
+				// connection breaks). That is fine — this goroutine has no
+				// other work, and Ticker.C drops extra ticks if SendRequest
+				// is slower than the interval.
+				if _, _, err := conn.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+					missing++
+				} else {
+					missing = 0
+				}
 			}
 		}
 	}()
@@ -391,6 +444,14 @@ func sessionChannelHandler(sshChannel ssh.NewChannel, conn *ssh.ServerConn, exec
 				execRequest = payload.Value
 				// We only accept one exec request per session
 				requestHandled = true
+
+				// Admin commands are handled inline (not via the tunnel-forward path).
+				// They run synchronously, send an exit-status, and return.
+				if strings.HasPrefix(execRequest, adminCommandPrefix) {
+					req.Reply(true, nil)
+					handleAdminExec(channel, conn, execRequest)
+					continue
+				}
 
 				// Signal SSH handler completion and pass channel for communication with client
 				execRequestCompleted <- execRequestCompletedData{channel: channel, request: execRequest}

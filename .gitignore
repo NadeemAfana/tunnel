@@ -28,6 +28,7 @@ udp-bridge-*
 # secrets
 secrets.env
 ssh_host_key*.*
+authorized_keys.json
 
 #GoLand IDE
 .idea/
