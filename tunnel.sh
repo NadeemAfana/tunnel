@@ -18,7 +18,9 @@ serverBindingPort=0       # server's local binding port for TCP/UDP. 0 means all
 # Default URL for auto-downloading the udp-bridge helper. Honors a pre-set
 # TUNNEL_BRIDGE_URL from the environment so users can pin a specific release
 # or point at a different repo without editing this script.
-TUNNEL_BRIDGE_URL="${TUNNEL_BRIDGE_URL:-https://github.com/NadeemAfana/tunnel/releases/latest/download/udp-bridge-{os}-{arch}}"
+if [[ -z "${TUNNEL_BRIDGE_URL:-}" ]]; then
+  TUNNEL_BRIDGE_URL='https://github.com/NadeemAfana/tunnel/releases/latest/download/udp-bridge-{os}-{arch}'
+fi
 
 printHelp () {
   printf "Creates a TCP, UDP, or HTTP tunnel between this machine and remote $TUNNEL_DOMAIN\n"
