@@ -1,6 +1,6 @@
-# HTTP and TCP Tunnel
-Built using plain Go framework and has no external dependencies for the tunnel implementation. 
-It works by using SSH por forwarding for the tunnels.
+# HTTP, TCP, and UDP Tunnel
+Built using plain Go framework and has no external dependencies for the tunnel implementation.
+It works by using SSH port forwarding for the tunnels.
 The tool supports the following features:
 
 1. The client side can use the `ssh` command-line tool and thus requires no additional installations.
@@ -81,6 +81,25 @@ Create a TCP tunnel at local port 3001 and remote port 5224.
 ```
 tunnel.sh tcp  3001 -p 5224
 ```
+
+Create a UDP tunnel at local port 5353 and remote port 5354.
+```
+tunnel.sh udp  5353 -p 5354
+```
+
+UDP mode requires a small helper binary (`udp-bridge`) on the client. By default `tunnel.sh` looks for it at `$HOME/.tunnel/udp-bridge` (`.exe` on Windows). To enable auto-download, set `TUNNEL_BRIDGE_URL` with `{os}` / `{arch}` placeholders pointing at your release assets:
+
+```
+export TUNNEL_BRIDGE_URL='https://github.com/owner/repo/releases/latest/download/udp-bridge-{os}-{arch}'
+```
+
+Supported `{os}-{arch}` combinations: `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`. Build them all with:
+
+```
+./build-bridge.sh
+```
+
+To use a custom binary location instead, set `UDP_BRIDGE_BIN` to the absolute path of the executable.
 
 For debugging and troubleshooting, append `--debug`
 ```

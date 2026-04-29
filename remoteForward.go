@@ -91,7 +91,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		} else if connTypeIndex == 0 {
 			connectionType = p[connTypeIndex+len("type="):]
 
-			if connectionType != "https" && connectionType != "http" && connectionType != "tcp" {
+			if connectionType != "https" && connectionType != "http" && connectionType != "tcp" && connectionType != "udp" {
 				log.Printf("invalid connectionType %s", connectionType)
 				return false, []byte(fmt.Sprintf("invalid connectionType %s", connectionType))
 			}
@@ -201,44 +201,112 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		return true, ssh.Marshal(&remoteForwardSuccess{uint32(destPort)})
 	}
 
-	// TCP mode (unchanged).
-	var ln net.Listener
-	var err error
-	forwardsLock.Lock()
-	requestBindPort := int(reqPayload.BindPort)
+	if connectionType == "udp" {
+		var udpConn net.PacketConn
+		var err error
+		requestBindPort := int(reqPayload.BindPort)
 
-	// 0 means allocate a random port
-	if requestBindPort == 0 {
-		for p := 1000; p <= 1<<16; p++ {
-			addr = net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(p))
-			if _, ok := forwards[addr]; !ok {
-				requestBindPort = p
-				reqPayload.BindPort = uint32(p)
-				break
+		if requestBindPort == 0 {
+			udpConn, err = net.ListenPacket("udp", net.JoinHostPort(reqPayload.BindAddr, "0"))
+			if err != nil {
+				log.Printf("error listening for UDP at %s:0: %s", reqPayload.BindAddr, err)
+				return false, []byte{}
+			}
+			_, portStr, _ := net.SplitHostPort(udpConn.LocalAddr().String())
+			p, _ := strconv.Atoi(portStr)
+			requestBindPort = p
+			reqPayload.BindPort = uint32(p)
+			addr = net.JoinHostPort(reqPayload.BindAddr, portStr)
+		} else {
+			forwardsLock.Lock()
+			if existing, ok := forwards[addr]; ok {
+				if existing.clientID == clientID {
+					log.Printf("Discarding existing UDP forward for same client id %s", clientID)
+					existing.listener.Close()
+					delete(forwards, addr)
+				} else {
+					forwardsLock.Unlock()
+					io.WriteString(session.channel, fmt.Sprintf("UDP port %d is already taken.\n", reqPayload.BindPort))
+					return false, []byte{}
+				}
+			}
+			forwardsLock.Unlock()
+
+			udpConn, err = net.ListenPacket("udp", addr)
+			if err != nil {
+				log.Printf("error listening for UDP address %s: %s", addr, err)
+				return false, []byte{}
 			}
 		}
+
+		forwardsLock.Lock()
+		forwards[addr] = forwardsListenerData{
+			listener:  udpConn,
+			clientID:  clientID,
+			sessionID: hex.EncodeToString(conn.SessionID()),
+			conType:   UDPConnectionType,
+		}
+		forwardsLock.Unlock()
+		conn.AddForwardAddr(addr)
+
+		io.WriteString(session.channel, fmt.Sprintf("%s:%d (udp)\n", domainURI.Hostname(), requestBindPort))
+
+		go runUDPListener(conn, udpConn, &reqPayload, addr, cancellationCtx)
+
+		return true, ssh.Marshal(&remoteForwardSuccess{uint32(requestBindPort)})
 	}
 
-	o, ok := forwards[addr]
-	if !ok || o.clientID == clientID {
-		if o.clientID == clientID {
-			log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
-			o.listener.Close()
+	// TCP mode.
+	var ln net.Listener
+	var err error
+	requestBindPort := int(reqPayload.BindPort)
+
+	if requestBindPort == 0 {
+		// Let the kernel pick a free port atomically — no need to hold
+		// forwardsLock across a scan. The bound address is what we register.
+		ln, err = net.Listen("tcp", net.JoinHostPort(reqPayload.BindAddr, "0"))
+		if err != nil {
+			log.Printf("error listening for TCP at %s:0: %s", reqPayload.BindAddr, err)
+			return false, []byte{}
 		}
+		_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+		p, _ := strconv.Atoi(portStr)
+		requestBindPort = p
+		reqPayload.BindPort = uint32(p)
+		addr = net.JoinHostPort(reqPayload.BindAddr, portStr)
+	} else {
+		// Caller-specified port. Briefly lock only to check for an existing
+		// same-client takeover, then release before the listen syscall.
+		forwardsLock.Lock()
+		if existing, ok := forwards[addr]; ok {
+			if existing.clientID == clientID {
+				log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
+				existing.listener.Close()
+				delete(forwards, addr)
+			} else {
+				forwardsLock.Unlock()
+				io.WriteString(session.channel, fmt.Sprintf("TCP port %d is already taken.\n", reqPayload.BindPort))
+				return false, []byte{}
+			}
+		}
+		forwardsLock.Unlock()
 
 		ln, err = net.Listen("tcp", addr)
 		if err != nil {
 			log.Printf("error listening for TCP address %s: %s", addr, err)
-			forwardsLock.Unlock()
 			return false, []byte{}
 		}
-		forwards[addr] = forwardsListenerData{listener: ln, clientID: clientID, sessionID: hex.EncodeToString(conn.SessionID()), conType: TCPConnectionType}
-	} else {
-		io.WriteString(session.channel, fmt.Sprintf("TCP port %d is already taken.\n", reqPayload.BindPort))
-		forwardsLock.Unlock()
-		return false, []byte{}
+	}
+
+	forwardsLock.Lock()
+	forwards[addr] = forwardsListenerData{
+		listener:  ln,
+		clientID:  clientID,
+		sessionID: hex.EncodeToString(conn.SessionID()),
+		conType:   TCPConnectionType,
 	}
 	forwardsLock.Unlock()
+	conn.AddForwardAddr(addr)
 
 	io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domainURI.Hostname(), requestBindPort))
 
@@ -325,7 +393,11 @@ func ensureHTTPServer(addr string, cancellationCtx context.Context) (net.Listene
 	forwardsLock.Lock()
 	if existing, ok := forwards[addr]; ok {
 		forwardsLock.Unlock()
-		return existing.listener, nil
+		l, ok := existing.listener.(net.Listener)
+		if !ok {
+			return nil, fmt.Errorf("address %s is already bound by a non-HTTP listener (%s)", addr, existing.conType)
+		}
+		return l, nil
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -548,7 +620,8 @@ func cancelForwardHandler(conn *sshConnection, req *ssh.Request, ctx context.Con
 		}
 		return true, nil
 	}
-	// TCP only
+	// TCP/UDP: closing the listener (or PacketConn) makes the per-forward
+	// goroutine exit and remove itself from the forwards map.
 	addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 	forwardsLock.Lock()
 	lnO, ok := forwards[addr]

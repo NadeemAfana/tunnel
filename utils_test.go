@@ -2,204 +2,148 @@ package main
 
 import (
 	"net/url"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"testing"
 )
 
-var _ = Describe("utils", func() {
-
-	Context("subDomainValid", func() {
-
-		It("should invalidate empty subdomain", func() {
-			for _, subDomain := range []string{"", "   "} {
-				valid := tunnelNameValid(subDomain)
-				Expect(valid).To(BeFalse())
+func TestTunnelNameValid(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		// "should invalidate empty subdomain"
+		{"empty", "", false},
+		{"whitespace only", "   ", false},
+		// "should validate subdomains"
+		{"valid alphanumeric", "abcd", true},
+		{"valid with single dash", "my-sub", true},
+		// "should invalidate multiple consecutive dashes"
+		{"consecutive dashes", "a--c", false},
+		{"consecutive dashes mid-name", "abc-d--r", false},
+		// "should validate multiple separate dashes"
+		{"separate dashes", "a-b-c", true},
+		{"separate dashes longer", "abc-d-r", true},
+		// "should invalidate subdomains with invalid chars"
+		{"asterisk", "a*bcd", false},
+		{"dot", "dsdsfs.fsdfd", false},
+		// "should invalidate subdomains beginning or ending with a dash"
+		{"leading dash", "-a-b-c", false},
+		{"trailing dash", "abc-d-r-", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tunnelNameValid(tt.input); got != tt.want {
+				t.Errorf("tunnelNameValid(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
+	}
+}
 
-		It("should validate subdomains", func() {
-			for _, subDomain := range []string{"abcd", "my-sub"} {
-				valid := tunnelNameValid(subDomain)
-				Expect(valid).To(BeTrue())
+func TestExtractSubdomain(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		domain  string
+		want    string
+		wantErr bool
+	}{
+		// "should error on empty subdomain" — original passes the package-level
+		// domainURL which is "" at test time (no main() ran), so we mirror that.
+		{"empty host", "", "", "", true},
+		// "should extract subdomain"
+		{"basic subdomain", "abc.domain.io", "domain.io", "abc", false},
+		{"hyphenated subdomain", "open-idc.domain.io", "domain.io", "open-idc", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := extractSubdomain(tt.host, tt.domain)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("extractSubdomain(%q, %q) err=%v, wantErr=%v", tt.host, tt.domain, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("extractSubdomain(%q, %q) = %q, want %q", tt.host, tt.domain, got, tt.want)
 			}
 		})
+	}
+}
 
-		It("should invalidate multiple consecutive dashes", func() {
-			for _, subDomain := range []string{"a--c", "abc-d--r"} {
-				valid := tunnelNameValid(subDomain)
-				Expect(valid).To(BeFalse())
+func TestExtractTunnelNameFromURLPath(t *testing.T) {
+	tests := []struct {
+		name      string
+		domainURL string
+		path      string
+		want      string
+		wantErr   bool
+	}{
+		// "should error when tunnelName not found in domainURL"
+		{"name not in domain (slash)", "http://domain.io/x/y/z", "/a/y/z/tunnel/c", "", true},
+		{"name not in domain (no slash)", "http://domain.io/x/y/z", "a/y/z/tunnel/c", "", true},
+		// "should extract tunnelName when domainURL has path"
+		{"matches with domain path (slash)", "http://domain.io/x/y/z", "/x/y/z/tunnel/c", "tunnel", false},
+		{"matches with domain path (no slash)", "http://domain.io/x/y/z", "x/y/z/tunnel/c", "tunnel", false},
+		// "should extract tunnelName when domainURL has no path"
+		{"no domain path (slash)", "https://domain.io", "/x/y/z/tunnel", "x", false},
+		{"no domain path (no slash)", "https://domain.io", "x/y/z/tunnel", "x", false},
+		// "should extract tunnelName when domainURL has empty path"
+		{"empty domain path (slash)", "https://domain.io/", "/x/y/z/tunnel", "x", false},
+		{"empty domain path (no slash)", "https://domain.io/", "x/y/z/tunnel", "x", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := url.Parse(tt.domainURL)
+			if err != nil {
+				t.Fatalf("parse domain url %q: %v", tt.domainURL, err)
+			}
+			got, err := extractTunnelNameFromURLPath(tt.path, *u)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
 
-		It("should validate multiple separate dashes", func() {
-			for _, subDomain := range []string{"a-b-c", "abc-d-r"} {
-				valid := tunnelNameValid(subDomain)
-				Expect(valid).To(BeTrue())
+func TestReplaceRequestURL(t *testing.T) {
+	newDomainLocalhost := "localhost"
+	newDomain456 := "newdomain:456"
+
+	tests := []struct {
+		name            string
+		requestURL      string
+		newHost         *string
+		stripPrefixPath string
+		want            string
+		wantErr         bool
+	}{
+		// "should replace request URL when requestURL has a relative path"
+		{"relative path no host (slash prefix)", "/x/y/z/tunnel/c", nil, "/x/y/z/tunnel", "/c", false},
+		{"relative path no host (no slash prefix)", "/x/y/z/tunnel/c", nil, "x/y/z/tunnel", "/c", false},
+		{"relative path with host", "/x/y/z/tunnel/c", &newDomainLocalhost, "/x/y/z/tunnel", "/c", false},
+		// "should replace request URL when requestURL has an absolute path"
+		{"absolute path no host (slash prefix)", "https://localhost:123/x/y/z/tunnel/c", nil, "/x/y/z/tunnel", "https://localhost:123/c", false},
+		{"absolute path no host (no slash prefix)", "https://localhost:123/x/y/z/tunnel/c", nil, "x/y/z/tunnel", "https://localhost:123/c", false},
+		{"absolute path with new host", "https://localhost:123/x/y/z/tunnel/c", &newDomain456, "/x/y/z/tunnel", "https://newdomain:456/c", false},
+		// "should replace request URL when requestURL has an absolute path without prefix path"
+		{"absolute path empty prefix", "https://localhost:123/x/y/z/tunnel/c", nil, "", "https://localhost:123/x/y/z/tunnel/c", false},
+		{"absolute path slash prefix", "https://localhost:123/x/y/z/tunnel/c", nil, "/", "https://localhost:123/x/y/z/tunnel/c", false},
+		{"absolute path new host empty prefix", "https://localhost:123/x/y/z/tunnel/c", &newDomain456, "", "https://newdomain:456/x/y/z/tunnel/c", false},
+		// "should replace request URL when requestURL has an empty path"
+		{"empty request path slash prefix", "/", nil, "/", "/", false},
+		{"empty request path empty prefix", "/", nil, "", "/", false},
+		// "should replace request URL when requestURL has relative path and prefix has different path"
+		{"prefix mismatch", "/relative", nil, "/path", "/relative", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := replaceRequestURL(tt.requestURL, tt.newHost, tt.stripPrefixPath)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("replaceRequestURL(%q, %v, %q) = %q, want %q", tt.requestURL, tt.newHost, tt.stripPrefixPath, got, tt.want)
 			}
 		})
-
-		It("should invalidate subdomains with invalid chars", func() {
-			for _, subDomain := range []string{"a*bcd", "dsdsfs.fsdfd"} {
-				valid := tunnelNameValid(subDomain)
-				Expect(valid).To(BeFalse())
-			}
-		})
-
-		It("should invalidate subdomains beginning or ending with a dash", func() {
-			for _, subDomain := range []string{"-a-b-c", "abc-d-r-"} {
-				valid := tunnelNameValid(subDomain)
-				Expect(valid).To(BeFalse())
-			}
-		})
-	})
-
-	Context("extractSubdomain from host", func() {
-
-		It("should error on empty subdomain", func() {
-			for _, host := range []string{""} {
-				_, err := extractSubdomain(host, domainURL)
-				Expect(err).To(HaveOccurred())
-			}
-		})
-
-		It("should extract subdomain", func() {
-			domainURL := "domain.io"
-			for _, host := range []string{"abc." + domainURL} {
-				s, err := extractSubdomain(host, domainURL)
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("abc"))
-			}
-		})
-
-		It("should extract subdomain", func() {
-			domainURL := "domain.io"
-			for _, host := range []string{"open-idc." + domainURL} {
-				s, err := extractSubdomain(host, domainURL)
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("open-idc"))
-			}
-		})
-	})
-
-	Context("extractTunelNameFromURLPath from URL path", func() {
-
-		It("should error when tunnelName not found in domainURL", func() {
-			domainURL, _ := url.Parse("http://domain.io/x/y/z")
-			for _, value := range []string{"/a/y/z/tunnel/c", "a/y/z/tunnel/c"} {
-				_, err := extractTunnelNameFromURLPath(value, *domainURL)
-				Expect(err).To(HaveOccurred())
-			}
-		})
-
-		It("should extract tunnelName when domainURL has path", func() {
-			domainURL, _ := url.Parse("http://domain.io/x/y/z")
-			for _, value := range []string{"/x/y/z/tunnel/c", "x/y/z/tunnel/c"} {
-				s, err := extractTunnelNameFromURLPath(value, *domainURL)
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("tunnel"))
-			}
-		})
-
-		It("should extract tunnelName when domainURL has no path", func() {
-			domainURL, _ := url.Parse("https://domain.io")
-			for _, value := range []string{"/x/y/z/tunnel", "x/y/z/tunnel"} {
-				s, err := extractTunnelNameFromURLPath(value, *domainURL)
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("x"))
-			}
-		})
-
-		It("should extract tunnelName when domainURL has empty path", func() {
-			domainURL, _ := url.Parse("https://domain.io/")
-			for _, value := range []string{"/x/y/z/tunnel", "x/y/z/tunnel"} {
-				s, err := extractTunnelNameFromURLPath(value, *domainURL)
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("x"))
-			}
-		})
-
-	})
-
-	Context("replaceRequestURL", func() {
-		It("should replace request URL when requestURL has a relative path", func() {
-
-			for _, value := range []string{"/x/y/z/tunnel/c"} {
-				s, err := replaceRequestURL(value, nil, "/x/y/z/tunnel")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("/c"))
-
-				s, err = replaceRequestURL(value, nil, "x/y/z/tunnel")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("/c"))
-
-				newDomain := "localhost"
-				s, err = replaceRequestURL(value, &newDomain, "/x/y/z/tunnel")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("/c"))
-			}
-		})
-
-		It("should replace request URL when requestURL has an absolute path", func() {
-			for _, value := range []string{"https://localhost:123/x/y/z/tunnel/c"} {
-				s, err := replaceRequestURL(value, nil, "/x/y/z/tunnel")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("https://localhost:123/c"))
-
-				s, err = replaceRequestURL(value, nil, "x/y/z/tunnel")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("https://localhost:123/c"))
-
-				newDomain := "newdomain:456"
-				s, err = replaceRequestURL(value, &newDomain, "/x/y/z/tunnel")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("https://newdomain:456/c"))
-
-			}
-		})
-
-		It("should replace request URL when requestURL has an absolute path without prefix path", func() {
-			for _, value := range []string{"https://localhost:123/x/y/z/tunnel/c"} {
-				s, err := replaceRequestURL(value, nil, "")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("https://localhost:123/x/y/z/tunnel/c"))
-
-				s, err = replaceRequestURL(value, nil, "/")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("https://localhost:123/x/y/z/tunnel/c"))
-
-				newDomain := "newdomain:456"
-				s, err = replaceRequestURL(value, &newDomain, "")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("https://newdomain:456/x/y/z/tunnel/c"))
-
-			}
-		})
-
-		It("should replace request URL when requestURL has an empty path", func() {
-			for _, value := range []string{"/"} {
-				s, err := replaceRequestURL(value, nil, "/")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("/"))
-
-			}
-
-			for _, value := range []string{"/"} {
-				s, err := replaceRequestURL(value, nil, "")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("/"))
-			}
-		})
-
-		It("should replace request URL when requestURL has relative path and prefix has different path", func() {
-			for _, value := range []string{"/relative"} {
-				s, err := replaceRequestURL(value, nil, "/path")
-				Expect(err).To(Not(HaveOccurred()))
-				Expect(s).To(Equal("/relative"))
-
-			}
-		})
-
-	})
-
-})
+	}
+}

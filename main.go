@@ -250,7 +250,9 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 	execRequestCompleted := make(chan execRequestCompletedData)
 	defer close(execRequestCompleted)
 	defer func() {
-		// Clean up subdomain cache
+		sessionID := hex.EncodeToString(conn.SessionID())
+
+		// Clean up subdomain cache (HTTP only — one tunnel name per connection).
 		subdomain := serverConnection.GetTunnelName()
 		if subdomain != nil {
 			forwardRequest := serverConnection.GetRequestForwardPayload()
@@ -259,7 +261,7 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 
 				sshTunnelListenersLock.Lock()
 				s, ok := sshTunnelListeners[cacheKey]
-				if ok && s.sessionID == hex.EncodeToString(conn.SessionID()) {
+				if ok && s.sessionID == sessionID {
 					delete(sshTunnelListeners, cacheKey)
 					log.Printf("Purged cache for HTTP session %s\n", s.sessionID)
 				}
@@ -267,19 +269,18 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 			}
 		}
 
-		// Clean up TCP listener as well since it's one-to-one.
-		forwardsLock.Lock()
-		forwardRequest := serverConnection.GetRequestForwardPayload()
-		if forwardRequest != nil {
-			cacheKey := net.JoinHostPort(forwardRequest.BindAddr, strconv.Itoa(int(forwardRequest.BindPort)))
-			o, ok := forwards[cacheKey]
-			if ok && o.conType == TCPConnectionType && o.sessionID == hex.EncodeToString(conn.SessionID()) {
-				delete(forwards, cacheKey)
+		// Close every TCP/UDP listener bound by this session. A session may
+		// register more than one forward, so iterate everything tracked.
+		for _, addr := range serverConnection.GetForwardAddrs() {
+			forwardsLock.Lock()
+			o, ok := forwards[addr]
+			if ok && o.sessionID == sessionID {
+				delete(forwards, addr)
 				o.listener.Close()
-				log.Printf("Purged cache for TCP session %s\n", o.sessionID)
+				log.Printf("Purged %s forward cache for session %s @ %s", o.conType, o.sessionID, addr)
 			}
+			forwardsLock.Unlock()
 		}
-		forwardsLock.Unlock()
 	}()
 
 	// The incoming Request channel must be serviced.

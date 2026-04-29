@@ -5,8 +5,6 @@ import (
 	"os"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -17,9 +15,4 @@ func TestMain(m *testing.M) {
 		log.SetOutput(io.Discard)
 	}
 	os.Exit(m.Run())
-}
-
-func TestValidation(t *testing.T) {
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Tunnel main suite")
 }

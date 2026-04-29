@@ -20,6 +20,11 @@ tmp
 # go files
 tunnel
 
+# udp-bridge build output
+dist/
+udp-bridge
+udp-bridge-*
+
 # secrets
 secrets.env
 ssh_host_key*.*

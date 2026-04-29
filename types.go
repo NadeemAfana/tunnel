@@ -1,7 +1,7 @@
 package main
 
 import (
-	"net"
+	"io"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -17,9 +17,9 @@ type sshTunnelsListenerData struct {
 }
 
 type forwardsListenerData struct {
-	listener  net.Listener
-	clientID  string // TCP only: For reconnecting: allow client to re-use same subdomain
-	sessionID string // TCP only: ditto
+	listener  io.Closer // net.Listener for TCP/HTTP forwards, net.PacketConn for UDP
+	clientID  string    // TCP/UDP only: For reconnecting: allow client to re-use same port
+	sessionID string    // TCP/UDP only: ditto
 	conType   connectionType
 }
 
@@ -53,3 +53,4 @@ type connectionType string
 
 var TCPConnectionType connectionType = "tcp"
 var HTTPConnectionType connectionType = "http"
+var UDPConnectionType connectionType = "udp"
