@@ -423,7 +423,7 @@ fi
 # Use uuidgen (works on Linux + macOS) with /proc fallback for stripped-down
 # Linux containers that may have neither uuidgen nor util-linux.
 sshClientID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
-sshServerArgs="tunnelName=$tunnelName,type=$type,header=$overrideHeaderHost,id=$sshClientID"
+sshServerArgs="tunnelName=$tunnelName,type=$type,header=$overrideHeaderHost,id=$sshClientID,localTarget=$localHostPort"
 
 # Extra args to pass to SSH cli
 sshCliArgs=" -o ConnectionAttempts=$((10**4))  -o ServerAliveInterval=20 -o ServerAliveCountMax=2"
@@ -491,16 +491,10 @@ do sleep 1
 done) > $fifo &
 child=$!
 
-# Read output from SSH using th pipe one line at a time and
-# print the tunneling http URLs.
+# Read output from SSH using the pipe one line at a time. The server
+# sends fully-formatted lines, so we just echo.
 stdbuf -oL head $fifo -n $((10**10)) | grep --line-buffered '.*' |
   while IFS= read -r LINE0
-  do    
-    if echo "${LINE0}" | grep -Pq "^(http[s]?://.*${TUNNEL_DOMAIN}|${TUNNEL_DOMAIN}:\d+)"; then
-          # The first line is always the full tunnel http URL
-          s="$localHostPort"
-          printf "Tunneling %s -> $s\n" "${LINE0}"
-      else
-        printf '%s\n' "${LINE0}"
-    fi
+  do
+    printf '%s\n' "${LINE0}"
   done

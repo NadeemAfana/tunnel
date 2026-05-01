@@ -24,6 +24,10 @@ const (
 	forwardedTCPChannelType = "forwarded-tcpip"
 )
 
+func formatTunnelLine(from, localTarget string) string {
+	return fmt.Sprintf("Tunneling %s -> %s\n", from, localTarget)
+}
+
 const bufferSize = 32 << 10 // 32 kB buffer.
 var bufPool = sync.Pool{
 	New: func() interface{} {
@@ -73,6 +77,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	tunnelName := ""
 	header := ""
 	connectionType := ""
+	localTarget := ""
 	headerSpecified := false
 
 	for _, p := range cmdParts {
@@ -81,6 +86,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		tunnelNameIndex := strings.Index(p, "tunnelname=")
 		connTypeIndex := strings.Index(p, "type=")
 		headerIndex := strings.Index(p, "header=")
+		localTargetIndex := strings.Index(p, "localtarget=")
 
 		if idIndex == 0 {
 			clientID = p[idIndex+len("id="):]
@@ -96,6 +102,8 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		} else if headerIndex == 0 {
 			header = p[headerIndex+len("header="):]
 			headerSpecified = true
+		} else if localTargetIndex == 0 {
+			localTarget = p[localTargetIndex+len("localtarget="):]
 		}
 	}
 
@@ -175,11 +183,13 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		log.Printf("using tunnelName %s", tunnelName)
 		conn.SetTunnelName(tunnelName)
 
+		var publicURL string
 		if domainPath {
-			io.WriteString(session.channel, fmt.Sprintf("%s/%s\n", domainURL, tunnelName))
+			publicURL = fmt.Sprintf("%s/%s", domainURL, tunnelName)
 		} else {
-			io.WriteString(session.channel, fmt.Sprintf("%s://%s.%s\n", domainURI.Scheme, tunnelName, domainURI.Hostname()))
+			publicURL = fmt.Sprintf("%s://%s.%s", domainURI.Scheme, tunnelName, domainURI.Hostname())
 		}
+		io.WriteString(session.channel, formatTunnelLine(publicURL, localTarget))
 
 		log.Printf("Received tcpip-forward for session %s started", hex.EncodeToString(conn.SessionID()))
 
@@ -247,7 +257,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		forwardsLock.Unlock()
 		conn.AddForwardAddr(addr)
 
-		io.WriteString(session.channel, fmt.Sprintf("%s:%d (udp)\n", domainURI.Hostname(), requestBindPort))
+		io.WriteString(session.channel, formatTunnelLine(fmt.Sprintf("UDP %s:%d", domainURI.Hostname(), requestBindPort), localTarget))
 
 		go runUDPListener(conn, udpConn, &reqPayload, addr, cancellationCtx)
 
@@ -306,7 +316,7 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	forwardsLock.Unlock()
 	conn.AddForwardAddr(addr)
 
-	io.WriteString(session.channel, fmt.Sprintf("%s:%d\n", domainURI.Hostname(), requestBindPort))
+	io.WriteString(session.channel, formatTunnelLine(fmt.Sprintf("TCP %s:%d", domainURI.Hostname(), requestBindPort), localTarget))
 
 	go func() {
 		for {
