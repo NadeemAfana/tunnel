@@ -115,6 +115,13 @@ func handleFlow(tcp net.Conn, target *net.UDPAddr) {
 	started := time.Now()
 	infof("UDP flow %s opened (target=%s)", flowID, target)
 
+	// Enable TCP keepalive so a dead SSH tunnel / remote peer surfaces in
+	// ~2 minutes instead of the OS default (~2 hours on Linux).
+	if tc, ok := tcp.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
+
 	udp, err := net.DialUDP("udp", nil, target)
 	if err != nil {
 		errorf("UDP flow %s: dial UDP %s failed: %s", flowID, target, err)
