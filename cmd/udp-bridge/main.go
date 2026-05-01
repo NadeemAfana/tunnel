@@ -22,7 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -49,25 +49,11 @@ var udpBufPool = sync.Pool{
 	},
 }
 
-var debug bool
-
-// Lightweight level-prefixed logging. Stdlib `log` has no native levels, but
-// prefixing each line keeps the bridge binary small while letting the user
-// (or a log aggregator) filter by severity.
-func errorf(format string, args ...any) { log.Printf("ERROR "+format, args...) }
-func warnf(format string, args ...any)  { log.Printf("WARN  "+format, args...) }
-func infof(format string, args ...any)  { log.Printf("INFO  "+format, args...) }
-func debugf(format string, args ...any) {
-	if debug {
-		log.Printf("DEBUG "+format, args...)
-	}
-}
-
 func main() {
 	bridge := flag.String("bridge", "127.0.0.1:0", "TCP bridge listen addr (port 0 = kernel-chosen)")
 	target := flag.String("target", "", "Local UDP target host:port")
 	showVersion := flag.Bool("version", false, "Print version and exit")
-	flag.BoolVar(&debug, "debug", false, "Verbose logging (per-packet)")
+	debug := flag.Bool("debug", false, "Verbose logging (per-packet)")
 	flag.Parse()
 
 	if *showVersion {
@@ -92,14 +78,17 @@ func main() {
 	// where to point `ssh -R`. stderr: human-readable logs.
 	fmt.Println(ln.Addr().String())
 
-	log.SetOutput(os.Stderr)
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	infof("UDP bridge v%s listening on %s -> %s (debug=%v)", version, ln.Addr(), targetAddr, debug)
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.Info("UDP listening", "version", version, "bridge", ln.Addr().String(), "target", targetAddr.String(), "debug", *debug)
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			errorf("UDP bridge: accept failed: %s", err)
+			slog.Error("accept failed", "err", err)
 			return
 		}
 		go handleFlow(c, targetAddr)
@@ -113,7 +102,8 @@ func main() {
 func handleFlow(tcp net.Conn, target *net.UDPAddr) {
 	flowID := tcp.RemoteAddr().String()
 	started := time.Now()
-	infof("UDP flow %s opened (target=%s)", flowID, target)
+	log := slog.With("flow", flowID)
+	log.Info("UDP flow opened", "target", target.String())
 
 	// Enable TCP keepalive so a dead SSH tunnel / remote peer surfaces in
 	// ~2 minutes instead of the OS default (~2 hours on Linux).
@@ -124,14 +114,14 @@ func handleFlow(tcp net.Conn, target *net.UDPAddr) {
 
 	udp, err := net.DialUDP("udp", nil, target)
 	if err != nil {
-		errorf("UDP flow %s: dial UDP %s failed: %s", flowID, target, err)
+		log.Error("dial UDP failed", "target", target.String(), "err", err)
 		tcp.Close()
 		return
 	}
 
 	var (
-		bytesIn, bytesOut int64
-		pktsIn, pktsOut   int64
+		bytesIn, bytesOut     int64
+		packetsIn, packetsOut int64
 	)
 
 	var wg sync.WaitGroup
@@ -146,12 +136,12 @@ func handleFlow(tcp net.Conn, target *net.UDPAddr) {
 		var hdr [2]byte
 		for {
 			if _, err := io.ReadFull(tcp, hdr[:]); err != nil {
-				debugf("UDP flow %s: TCP read EOF/error: %s", flowID, err)
+				log.Debug("TCP read EOF/error", "err", err)
 				return
 			}
 			n := int(binary.BigEndian.Uint16(hdr[:]))
 			if n > udpMaxDatagramSize {
-				warnf("UDP flow %s: oversized incoming frame (%d bytes); aborting", flowID, n)
+				log.Warn("oversized incoming frame; aborting", "bytes", n)
 				return
 			}
 
@@ -160,20 +150,20 @@ func handleFlow(tcp net.Conn, target *net.UDPAddr) {
 			if n > 0 {
 				if _, err := io.ReadFull(tcp, payload); err != nil {
 					udpBufPool.Put(bufPtr)
-					debugf("UDP flow %s: TCP payload read error: %s", flowID, err)
+					log.Debug("TCP payload read error", "err", err)
 					return
 				}
 			}
 			if _, err := udp.Write(payload); err != nil {
 				udpBufPool.Put(bufPtr)
-				debugf("UDP flow %s: UDP write error: %s", flowID, err)
+				log.Debug("UDP write error", "err", err)
 				return
 			}
 			udpBufPool.Put(bufPtr)
 
-			atomic.AddInt64(&pktsIn, 1)
+			atomic.AddInt64(&packetsIn, 1)
 			atomic.AddInt64(&bytesIn, int64(n))
-			debugf("UDP flow %s: server -> local UDP: %d bytes", flowID, n)
+			log.Debug("server -> local UDP", "bytes", n)
 		}
 	}()
 
@@ -191,40 +181,42 @@ func handleFlow(tcp net.Conn, target *net.UDPAddr) {
 		for {
 			n, err := udp.Read(buf)
 			if err != nil {
-				debugf("UDP flow %s: UDP read EOF/error: %s", flowID, err)
+				log.Debug("UDP read EOF/error", "err", err)
 				return
 			}
 			if n > udpMaxDatagramSize {
 				// Should be impossible from the kernel, but guard anyway.
-				warnf("UDP flow %s: oversized local datagram (%d bytes); dropping", flowID, n)
+				log.Warn("oversized local datagram; dropping", "bytes", n)
 				continue
 			}
 			binary.BigEndian.PutUint16(hdr[:], uint16(n))
 			if _, err := tcp.Write(hdr[:]); err != nil {
-				debugf("UDP flow %s: TCP write hdr error: %s", flowID, err)
+				log.Debug("TCP write hdr error", "err", err)
 				return
 			}
 			if n > 0 {
 				if _, err := tcp.Write(buf[:n]); err != nil {
-					debugf("UDP flow %s: TCP write payload error: %s", flowID, err)
+					log.Debug("TCP write payload error", "err", err)
 					return
 				}
 			}
-			atomic.AddInt64(&pktsOut, 1)
+			atomic.AddInt64(&packetsOut, 1)
 			atomic.AddInt64(&bytesOut, int64(n))
-			debugf("UDP flow %s: local UDP -> server: %d bytes", flowID, n)
+			log.Debug("local UDP -> server", "bytes", n)
 		}
 	}()
 
 	wg.Wait()
-	elapsed := time.Since(started).Round(10 * time.Millisecond)
-	infof("UDP flow %s closed after %s (in=%dB/%dpkts out=%dB/%dpkts)",
-		flowID, elapsed,
-		atomic.LoadInt64(&bytesIn), atomic.LoadInt64(&pktsIn),
-		atomic.LoadInt64(&bytesOut), atomic.LoadInt64(&pktsOut))
+	log.Info("UDP flow closed",
+		"elapsed", time.Since(started).Round(10*time.Millisecond).String(),
+		"in_bytes", atomic.LoadInt64(&bytesIn),
+		"in_packets", atomic.LoadInt64(&packetsIn),
+		"out_bytes", atomic.LoadInt64(&bytesOut),
+		"out_packets", atomic.LoadInt64(&packetsOut),
+	)
 }
 
-func die(format string, args ...interface{}) {
+func die(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "ERROR udp-bridge: "+format+"\n", args...)
 	os.Exit(1)
 }
