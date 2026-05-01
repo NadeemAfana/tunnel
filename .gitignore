@@ -22,8 +22,8 @@ tunnel
 
 # udp-bridge build output
 dist/
-udp-bridge
-udp-bridge-*
+/udp-bridge
+/udp-bridge-*
 
 # secrets
 secrets.env
