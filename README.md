@@ -8,12 +8,19 @@ The tool supports the following features:
 1. Rewrites the `Origin` and `Host` headers for HTTP tunnels.
 1. Can be hosted behind reverse-proxy and anywhere in the cloud, k8s, etc.
 
-# Why Use This If There Are Alternatives
+# Why use this if there are alternatives
 1. Security and transparency if you want 100% control over the full traffic. That's why I mainly built this.
 1. It's FREE and has no limitation on its usage.
 
 # Server Setup
-1. Create an `ssh_host_key_enc` env variable that contains the base64 value of the SSH host-specific private key which is used to identify the host. You can generate a new key using the command `ssh-keygen -t ecdsa -f /tmp/ssh` to generate the file and then base64 encode it `cat /tmp/ssh | base64 -w 0`.
+1. Create an `ssh_host_key_enc` env variable that contains the base64 value of the SSH host-specific private key which is used to identify the host. Generate the key with `ssh-keygen -t ecdsa -f /tmp/ssh`, then capture the base64 directly into a variable so it never lands in the terminal scrollback or shell history:
+
+    ```bash
+    ssh_host_key_enc="$(base64 -w 0 < /tmp/ssh)"
+    export ssh_host_key_enc
+    ```
+
+    On macOS, `base64` has no `-w` flag and emits a single line by default, so use `ssh_host_key_enc="$(base64 < /tmp/ssh)"` there.
 1. Create an authorized keys JSON file and pass its path to the server with `--authorizedKeysFile=/etc/tunnel/authorized_keys.json`. Each client that wants to connect must have their public key added to this file. The format is:
 
     ```json
@@ -28,7 +35,7 @@ The tool supports the following features:
     The `name` is used in server logs to identify which client connected. The `publicKey` is the same single-line format you would put in an OpenSSH `authorized_keys` file.
 1. (Optional) Enable runtime admin commands so authorized keys can be added or removed without restarting the server. Generate a bcrypt hash of an admin passphrase using the tunnel binary itself (no external tools required) and set it as `admin_passphrase_bcrypt`:
 
-    ```
+    ```bash
     read -rs -p 'Admin passphrase: ' p; echo
     echo -n "$p" | ./tunnel --genAdminHash
     # copy the printed $2a$12$... hash into the env var
@@ -37,7 +44,7 @@ The tool supports the following features:
 
     If `admin_passphrase_bcrypt` is unset, the server logs `Admin commands disabled` on startup and rejects any admin request. See [Managing Authorized Keys at Runtime](#managing-authorized-keys-at-runtime) below for the client commands.
 1. The tunnel requires a **DNS domain** to work. The domain and all subdomains must point to the server for the http tunnel to work unless the option `--domainPath` is used. 
-The app will assign a unique subdomain for each HTTP client. For example, if your DNS domain is  `abc.io`, then `x.abc.io` and all subdomains (ie `*.abc.io`) must point to the server.
+The app will assign a unique subdomain for each HTTP client. For example, if your DNS domain is  `abc.io`, then `abc.io` and all subdomains (ie `*.abc.io`) must point to the server.
 1. The following TCP ports must be open on the server
     1. **3000** (default) for incoming HTTP traffic. Override with `--httpPort=N`. The default is an unprivileged port so the binary can run as a non-root user; front it with a reverse proxy (ALB, Nginx, Caddy, etc.) on 80/443 if you want clean public URLs.
     1. **5223** for SSH.
@@ -317,6 +324,7 @@ Supported `{os}-{arch}` combinations: `linux-amd64`, `linux-arm64`, `darwin-amd6
 
 To use a custom binary location instead, set `UDP_BRIDGE_BIN` to the absolute path of the executable.
 
+## Troubleshooting
 For debugging and troubleshooting, append `--debug`
 ```
 tunnel.sh 3000 -n abc --debug
@@ -328,7 +336,7 @@ For more info
 tunnel.sh --help
 ```
 
-# Tests
+## Tests
 To run the tests
 ```
 go test

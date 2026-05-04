@@ -171,7 +171,10 @@ if [[ "$1" = "admin" ]]; then
   # word splitting on both bash 3.2 (macOS) and modern bash.
   adminSshArgs=(-o ConnectionAttempts=3 -o "PubkeyAcceptedKeyTypes=+ssh-rsa" -p "$sshPort")
   if [[ -n "$adminKeyFile" ]]; then
-    adminSshArgs+=(-i "$adminKeyFile")
+    # IdentitiesOnly=yes prevents ssh from falling back to ~/.ssh/id_* or
+    # ssh-agent identities, so the auth must use exactly the key the user
+    # passed via -k.
+    adminSshArgs+=(-i "$adminKeyFile" -o IdentitiesOnly=yes)
   fi
 
   case "$adminSubcommand" in
@@ -432,7 +435,10 @@ sshServerArgs="tunnelName=$tunnelName,type=$type,header=$overrideHeaderHost,id=$
 sshCliArgs=" -o ConnectionAttempts=$((10**4))  -o ServerAliveInterval=20 -o ServerAliveCountMax=2"
 
 if [[ $key  ]]; then
-  sshCliArgs="$sshCliArgs -i $key"
+  # IdentitiesOnly=yes prevents ssh from falling back to ~/.ssh/id_* or
+  # ssh-agent identities, so the auth must use exactly the key the user
+  # passed via -k.
+  sshCliArgs="$sshCliArgs -i $key -o IdentitiesOnly=yes"
 fi
 
 # Default remotePort if -p wasn't given. 0 = "let the server decide": for
@@ -487,8 +493,27 @@ trap cleanup EXIT SIGINT SIGTERM
 
 
 # Use -v for verbose logs and -vv or -vvv for very verbose logs (eg keepalive messages sent from client)
-(until ssh  -o 'PubkeyAcceptedKeyTypes +ssh-rsa' -n -p $sshPort $sshCliArgs  -R "*:$remotePort:$localHostPort" $USER@$TUNNEL_DOMAIN "$sshServerArgs" 2>&1;
-do sleep 1
+# The retry loop is for transient drops once a session was established. ssh
+# collapses auth failure, connection refused, DNS errors, etc. all into
+# exit code 255, so we can't tell those apart from the exit code alone.
+# Heuristic: if ssh exits in under fastFailSeconds the failure is
+# non-transient (config/auth/host) and looping would just spam the same
+# error, so signal the parent to exit. $SECONDS is portable to bash 3.2
+# (macOS default) and immune to wall-clock changes.
+fastFailSeconds=5
+(while :; do
+  startedAt=$SECONDS
+  ssh -o 'PubkeyAcceptedKeyTypes +ssh-rsa' -n -p $sshPort $sshCliArgs -R "*:$remotePort:$localHostPort" $USER@$TUNNEL_DOMAIN "$sshServerArgs" 2>&1
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
+    break
+  fi
+  if (( SECONDS - startedAt < fastFailSeconds )); then
+    printf 'tunnel.sh: ssh exited with code %d in under %ds; not retrying.\n' "$rc" "$fastFailSeconds" >&2
+    kill -TERM $$
+    exit $rc
+  fi
+  sleep 1
 done) > $fifo &
 child=$!
 
