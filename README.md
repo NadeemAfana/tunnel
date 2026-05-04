@@ -39,26 +39,26 @@ The tool supports the following features:
 1. The tunnel requires a **DNS domain** to work. The domain and all subdomains must point to the server for the http tunnel to work unless the option `--domainPath` is used. 
 The app will assign a unique subdomain for each HTTP client. For example, if your DNS domain is  `abc.io`, then `x.abc.io` and all subdomains (ie `*.abc.io`) must point to the server.
 1. The following TCP ports must be open on the server
-    1. **80** for incoming http traffic.
+    1. **3000** (default) for incoming HTTP traffic. Override with `--httpPort=N`. The default is an unprivileged port so the binary can run as a non-root user; front it with a reverse proxy (ALB, Nginx, Caddy, etc.) on 80/443 if you want clean public URLs.
     1. **5223** for SSH.
-    1. Any additional ports opened at runtime for the TCP/UDP tunnel(s).   
-2. Run the server 
+    1. Any additional ports opened at runtime for the TCP/UDP tunnel(s).
+2. Run the server
     ```
     CGO_ENABLED=0 go build
     ./tunnel --domainUrl=https://mydomain.io --authorizedKeysFile=/etc/tunnel/authorized_keys.json
     ```
 
-    For Docker (multi-stage build - no host Go toolchain required; mount the keys file into the container)
+    For Docker (multi-stage build, no host Go toolchain required; the image runs as a non-root user, so HTTP defaults to 3000)
     ```
      docker build . -t=tunnel
-     docker run -p 80:80 -p 5223:5223 \
+     docker run -p 3000:3000 -p 5223:5223 \
        -e ssh_host_key_enc='LS0tCg==' \
        -v /etc/tunnel/authorized_keys.json:/etc/tunnel/authorized_keys.json:ro \
        tunnel \
          --domainUrl=https://mydomain.io \
          --authorizedKeysFile=/etc/tunnel/authorized_keys.json
-
     ```
+    Use `-p 80:3000` (or set `--httpPort=80` and run as root) if you want incoming traffic on port 80 directly without a reverse proxy.
 
 ## Client Setup
 The shell script `tunnel.sh` wraps `ssh` and adds automatic reconnection. The server only requires a standard OpenSSH client, which ships with macOS, Linux, and Windows 10 or later. Each example below shows the `tunnel.sh` invocation and the equivalent raw `ssh` command, so you can use the tool without the wrapper script.
@@ -77,8 +77,9 @@ The raw `ssh` commands below use these conventions so they work the same in **ba
 
 * Double quotes around `-R` and the trailing argument. Single quotes are not portable to Windows shells.
 * `-o KEY=VALUE` (no spaces) avoids extra quoting.
-* `alice` is a placeholder for the `name` field of your entry in [authorized_keys.json](authorized_keys.json). It does NOT need to match your local OS username. Replace `mydomain.io` with your `$TUNNEL_DOMAIN`.
+* `username` is a placeholder. The server does NOT validate the SSH username (only the public key matters), so any value works. Conventionally use the same string as your `name` field in [authorized_keys.json](authorized_keys.json) so server logs are easier to read. Replace `mydomain.io` with your `$TUNNEL_DOMAIN`.
 * Add `-i path/to/key` if you need to point at a specific private key.
+* The remote bind port in `-R bindPort:host:port` is `0` for HTTP/HTTPS (the server pins the listener to its `--httpPort`, default 3000), a chosen port for TCP/UDP, or `0` to let the server pick a free TCP/UDP port. The server rejects a non-zero, non-matching bind port for HTTP/HTTPS with a clear error.
 
 The trailing quoted string is parsed by the server.
 
@@ -92,7 +93,7 @@ The trailing quoted string is parsed by the server.
 
 ### HTTP tunnel via URL path (no subdomain)
 
-If you cannot use subdomains, a single domain can be used for all users using a URL path. For example, to create an HTTP tunnel at local port 3000 (`https://mydomain.io/alice` points to `http://localhost:3000`):
+If you cannot use subdomains, a single domain can be used for all users using a URL path. For example, to create an HTTP tunnel at local port 3000 (`https://mydomain.io/username` points to `http://localhost:3000`):
 
 Run the server with
 ```
@@ -105,18 +106,18 @@ tunnel.sh 3000
 ```
 Or with `ssh` directly:
 ```
-ssh -p 5223 -R "*:80:localhost:3000" alice@mydomain.io "type=http,tunnelName=alice,header=localhost:3000,localTarget=localhost:3000"
+ssh -p 5223 -R "*:0:localhost:3000" username@mydomain.io "type=http,tunnelName=username,header=localhost:3000,localTarget=localhost:3000"
 ```
 
 ### HTTP tunnel at a subdomain
 
-Create an HTTP tunnel at local port 3000 (`https://alice.mydomain.io` points to `http://localhost:3000`):
+Create an HTTP tunnel at local port 3000 (`https://username.mydomain.io` points to `http://localhost:3000`):
 ```
 tunnel.sh 3000
 ```
 Or with `ssh` directly:
 ```
-ssh -p 5223 -R "*:80:localhost:3000" alice@mydomain.io "type=http,tunnelName=alice,header=localhost:3000,localTarget=localhost:3000"
+ssh -p 5223 -R "*:0:localhost:3000" username@mydomain.io "type=http,tunnelName=username,header=localhost:3000,localTarget=localhost:3000"
 ```
 
 Create an HTTP tunnel at local port 3000 at subdomain `abc` (`https://abc.mydomain.io` points to `http://localhost:3000`):
@@ -125,27 +126,27 @@ tunnel.sh 3000 -n abc
 ```
 Or with `ssh` directly:
 ```
-ssh -p 5223 -R "*:80:localhost:3000" alice@mydomain.io "type=http,tunnelName=abc,header=localhost:3000,localTarget=localhost:3000"
+ssh -p 5223 -R "*:0:localhost:3000" username@mydomain.io "type=http,tunnelName=abc,header=localhost:3000,localTarget=localhost:3000"
 ```
 
 ### HTTP tunnel forwarding to another host
 
-Create an HTTP tunnel for forward host example.com at port 3000 (`https://alice.mydomain.io` points to `http://example.com:3000`):
+Create an HTTP tunnel for forward host example.com at port 3000 (`https://username.mydomain.io` points to `http://example.com:3000`):
 ```
 tunnel.sh example.com:3000
 ```
 Or with `ssh` directly:
 ```
-ssh -p 5223 -R "*:80:example.com:3000" alice@mydomain.io "type=http,tunnelName=alice,header=example.com:3000,localTarget=example.com:3000"
+ssh -p 5223 -R "*:0:example.com:3000" username@mydomain.io "type=http,tunnelName=username,header=example.com:3000,localTarget=example.com:3000"
 ```
 
-Create an HTTPS tunnel for forward host example.com at port 443 (`https://alice.mydomain.io` points to `https://example.com`):
+Create an HTTPS tunnel for forward host example.com at port 443 (`https://username.mydomain.io` points to `https://example.com`):
 ```
 tunnel.sh example.com:443 --https
 ```
 Or with `ssh` directly:
 ```
-ssh -p 5223 -R "*:80:example.com:443" alice@mydomain.io "type=https,tunnelName=alice,header=example.com:443,localTarget=example.com:443"
+ssh -p 5223 -R "*:0:example.com:443" username@mydomain.io "type=https,tunnelName=username,header=example.com:443,localTarget=example.com:443"
 ```
 
 ### TCP tunnel
@@ -156,7 +157,7 @@ tunnel.sh tcp 3001 -p 5224
 ```
 Or with `ssh` directly:
 ```
-ssh -p 5223 -R "*:5224:localhost:3001" alice@mydomain.io "type=tcp,localTarget=localhost:3001"
+ssh -p 5223 -R "*:5224:localhost:3001" username@mydomain.io "type=tcp,localTarget=localhost:3001"
 ```
 
 ### UDP tunnel
@@ -172,7 +173,7 @@ UDP requires the `udp-bridge` helper because SSH only forwards TCP. `tunnel.sh` 
 udp-bridge --bridge=127.0.0.1:7777 --target=localhost:5353
 
 # Terminal 2: forward remote UDP port 5354 to the bridge's TCP port
-ssh -p 5223 -R "*:5354:127.0.0.1:7777" alice@mydomain.io "type=udp,localTarget=localhost:5353"
+ssh -p 5223 -R "*:5354:127.0.0.1:7777" username@mydomain.io "type=udp,localTarget=localhost:5353"
 ```
 On Windows, run `udp-bridge.exe` instead of `udp-bridge`.
 
@@ -184,7 +185,7 @@ tunnel.sh 3000 -h api.example.com
 ```
 Or with `ssh` directly:
 ```
-ssh -p 5223 -R "*:80:localhost:3000" alice@mydomain.io "type=http,tunnelName=alice,header=api.example.com,localTarget=localhost:3000"
+ssh -p 5223 -R "*:0:localhost:3000" username@mydomain.io "type=http,tunnelName=username,header=api.example.com,localTarget=localhost:3000"
 ```
 
 ### TCP tunnel with a server-allocated remote port
@@ -195,7 +196,7 @@ tunnel.sh tcp 3001
 ```
 Or with `ssh` directly (port `0` asks the server to choose):
 ```
-ssh -p 5223 -R "*:0:localhost:3001" alice@mydomain.io "type=tcp,localTarget=localhost:3001"
+ssh -p 5223 -R "*:0:localhost:3001" username@mydomain.io "type=tcp,localTarget=localhost:3001"
 ```
 
 ### Specifying a private key file
@@ -206,9 +207,9 @@ tunnel.sh 3000 -k ~/.ssh/id_ed25519_tunnel
 ```
 Or with `ssh` directly:
 ```
-ssh -i ~/.ssh/id_ed25519_tunnel -p 5223 -R "*:80:localhost:3000" alice@mydomain.io "type=http,tunnelName=alice,header=localhost:3000,localTarget=localhost:3000"
+ssh -i ~/.ssh/id_ed25519_tunnel -p 5223 -R "*:0:localhost:3000" username@mydomain.io "type=http,tunnelName=username,header=localhost:3000,localTarget=localhost:3000"
 ```
-On Windows, use the full path (e.g. `C:\Users\alice\.ssh\id_ed25519_tunnel`).
+On Windows, use the full path (e.g. `C:\Users\username\.ssh\id_ed25519_tunnel`).
 
 ### Reclaiming the same subdomain after reconnect (raw `ssh`)
 
@@ -216,11 +217,11 @@ On Windows, use the full path (e.g. `C:\Users\alice\.ssh\id_ed25519_tunnel`).
 ```
 # bash / zsh
 TUNNEL_ID=$(uuidgen)
-ssh -p 5223 -R "*:80:localhost:3000" alice@mydomain.io "type=http,tunnelName=abc,id=$TUNNEL_ID,header=localhost:3000,localTarget=localhost:3000"
+ssh -p 5223 -R "*:0:localhost:3000" username@mydomain.io "type=http,tunnelName=abc,id=$TUNNEL_ID,header=localhost:3000,localTarget=localhost:3000"
 
 # PowerShell
 $TUNNEL_ID = [guid]::NewGuid().ToString()
-ssh -p 5223 -R "*:80:localhost:3000" alice@mydomain.io "type=http,tunnelName=abc,id=$TUNNEL_ID,header=localhost:3000,localTarget=localhost:3000"
+ssh -p 5223 -R "*:0:localhost:3000" username@mydomain.io "type=http,tunnelName=abc,id=$TUNNEL_ID,header=localhost:3000,localTarget=localhost:3000"
 ```
 Without `id=`, a reconnect after a transient network drop may return a different random subdomain because the server cannot prove the new connection belongs to the previous owner of `abc`.
 
@@ -270,28 +271,28 @@ $ADMIN_PASS = (Read-Host -AsSecureString -Prompt 'Admin passphrase' | ConvertFro
 List authorized keys:
 ```
 # bash / zsh
-printf '%s\n' "$ADMIN_PASS" | ssh -p 5223 alice@mydomain.io tunnel-admin list
+printf '%s\n' "$ADMIN_PASS" | ssh -p 5223 username@mydomain.io tunnel-admin list
 
 # PowerShell
-$ADMIN_PASS | ssh -p 5223 alice@mydomain.io tunnel-admin list
+$ADMIN_PASS | ssh -p 5223 username@mydomain.io tunnel-admin list
 ```
 
 Add a key (`bob` becomes the entry name; `~/keys/bob.pub` is the OpenSSH-format public key):
 ```
 # bash / zsh
-printf '%s\n%s' "$ADMIN_PASS" "$(cat ~/keys/bob.pub)" | ssh -p 5223 alice@mydomain.io tunnel-admin add bob
+printf '%s\n%s' "$ADMIN_PASS" "$(cat ~/keys/bob.pub)" | ssh -p 5223 username@mydomain.io tunnel-admin add bob
 
 # PowerShell
-"$ADMIN_PASS`n$(Get-Content -Raw ~/keys/bob.pub)" | ssh -p 5223 alice@mydomain.io tunnel-admin add bob
+"$ADMIN_PASS`n$(Get-Content -Raw ~/keys/bob.pub)" | ssh -p 5223 username@mydomain.io tunnel-admin add bob
 ```
 
 Remove a key:
 ```
 # bash / zsh
-printf '%s\n' "$ADMIN_PASS" | ssh -p 5223 alice@mydomain.io tunnel-admin remove bob
+printf '%s\n' "$ADMIN_PASS" | ssh -p 5223 username@mydomain.io tunnel-admin remove bob
 
 # PowerShell
-$ADMIN_PASS | ssh -p 5223 alice@mydomain.io tunnel-admin remove bob
+$ADMIN_PASS | ssh -p 5223 username@mydomain.io tunnel-admin remove bob
 ```
 
 Add `-i path/to/key` if the matching identity is not your default key. On Windows `cmd.exe`, multi-line stdin is awkward; use PowerShell or Git Bash for the `add` command.

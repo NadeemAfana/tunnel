@@ -7,7 +7,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/tunnel .
 
-FROM gcr.io/distroless/static-debian12:latest
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/tunnel /tunnel
-EXPOSE 80 5223
+USER nonroot:nonroot
+EXPOSE 3000 5223
 ENTRYPOINT ["/tunnel"]

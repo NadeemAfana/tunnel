@@ -33,6 +33,8 @@ authorized_keys.json
 #GoLand IDE
 .idea/
 
+deploy.sh
+
 .vscode
 
 # Unit test files

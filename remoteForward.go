@@ -19,10 +19,14 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const (
-	httpBindPort            = 80
-	forwardedTCPChannelType = "forwarded-tcpip"
-)
+// httpBindPort is the remote bind port that distinguishes HTTP/HTTPS forwards
+// from raw TCP/UDP forwards. It is mutable so main.go can override the default
+// at startup via the --httpPort flag. The client-side wrapper (tunnel.sh) and
+// any raw `ssh -R` invocations must request the same port for HTTP traffic to
+// be recognized.
+var httpBindPort uint32 = 3000
+
+const forwardedTCPChannelType = "forwarded-tcpip"
 
 func formatTunnelLine(from, localTarget string) string {
 	return fmt.Sprintf("Tunneling %s -> %s\n", from, localTarget)
@@ -112,15 +116,42 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		clientID = hex.EncodeToString(conn.SessionID())
 	}
 
-	// Server localhost:port to listen for http requests at
-	addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
+	// For HTTP/HTTPS, the public port is server-controlled (httpBindPort) and
+	// not a per-client choice. Reject explicit non-matching ports rather than
+	// silently ignoring them, so a user passing `-p 800 --http` gets a clear
+	// error instead of wondering why their port was discarded. Clients should
+	// send 0 (or omit `-p`); httpBindPort is also accepted as a no-op.
+	if connectionType == "http" || connectionType == "https" {
+		if reqPayload.BindPort != 0 && reqPayload.BindPort != httpBindPort {
+			msg := fmt.Sprintf("HTTP/HTTPS tunnels do not accept a custom remote port; "+
+				"the server binds to --httpPort=%d. Send 0 (or omit -p) instead of %d.\n",
+				httpBindPort, reqPayload.BindPort)
+			io.WriteString(session.channel, msg)
+			return false, []byte(msg)
+		}
+	}
+
+	// Server localhost:port to listen for http requests at.
+	// For HTTP/HTTPS, pin the shared listener to httpBindPort regardless of
+	// what the client requested. HTTP discrimination is driven entirely by
+	// `type=http|https` in the exec command. Rewrite reqPayload.BindPort to
+	// the effective port so disconnect cleanup at main.go and the cancel
+	// handler below build matching cache keys (mirrors the TCP/UDP pattern
+	// where the server-allocated port is written back to reqPayload).
+	var addr string
+	if connectionType == "http" || connectionType == "https" {
+		reqPayload.BindPort = httpBindPort
+		addr = net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(httpBindPort)))
+	} else {
+		addr = net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
+	}
 
 	// Update connection with tunnelName and payload
 	conn.SetRequestForwardPayload(&reqPayload)
 
 	// TCP or HTTP?
 	// For TCP, the connection is one-to-one meaning the local listener is exclusively for this SSH client.
-	// For HTTP (port 80/httpBindPort), the connection is shared and thus many-to-one meaning the local listener on server is shared across many HTTP Clients.
+	// For HTTP (httpBindPort), the connection is shared and thus many-to-one meaning the local listener on server is shared across many HTTP Clients.
 	if connectionType == "http" || connectionType == "https" {
 		// Mimic ^[a-zA-Z0-9](?!.*--)[a-zA-Z0-9-]+[a-zA-Z0-9]$ as Go does not support lookarounds
 		tunnelNameValid := tunnelNameValid(tunnelName)
@@ -199,8 +230,18 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		// SSH forwarded-tcpip channel per dial.
 		httpListener, err := ensureHTTPServer(addr, cancellationCtx)
 		if err != nil {
-			log.Fatalf("error listening for address %s: %s", addr, err)
-			return false, []byte{}
+			// Bind failure is recoverable per-request: roll back the listener
+			// entry we just inserted and reject this forward. Killing the whole
+			// process here would take down every other live tunnel for what is
+			// usually a port-collision (someone else is on httpBindPort).
+			sshTunnelListenersLock.Lock()
+			if cached, ok := sshTunnelListeners[addr+tunnelName]; ok && cached.sessionID == hex.EncodeToString(conn.SessionID()) {
+				delete(sshTunnelListeners, addr+tunnelName)
+			}
+			sshTunnelListenersLock.Unlock()
+			log.Printf("error listening for address %s: %s", addr, err)
+			io.WriteString(session.channel, fmt.Sprintf("server failed to bind HTTP listener at %s: %s\n", addr, err))
+			return false, []byte(fmt.Sprintf("listen %s: %s", addr, err))
 		}
 
 		_, destPortStr, _ := net.SplitHostPort(httpListener.Addr().String())
@@ -593,7 +634,7 @@ func dialSSHChannel(ctx context.Context) (net.Conn, error) {
 
 	payload := ssh.Marshal(&remoteForwardChannelData{
 		DestAddr:   data.reqPayload.BindAddr,
-		DestPort:   uint32(httpBindPort),
+		DestPort:   httpBindPort,
 		OriginAddr: origin.addr,
 		OriginPort: origin.port,
 	})

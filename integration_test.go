@@ -65,6 +65,19 @@ func setupTestServer(t *testing.T, domain string, usePath bool) *integrationTest
 	}
 	domainPath = usePath
 
+	// Pre-allocate a free port and pin httpBindPort to it. This mirrors
+	// production where the configured --httpPort differs from what the client
+	// sends on -R (the client sends 0, the server pins to httpBindPort), so
+	// any cache-key bug that only manifests when those differ is exercised
+	// here. Avoids the package default (3000) which may be in use on the host.
+	prevHTTPBindPort := httpBindPort
+	preLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("alloc http port: %v", err)
+	}
+	httpBindPort = uint32(preLn.Addr().(*net.TCPAddr).Port)
+	preLn.Close()
+
 	forwardsLock.Lock()
 	for _, l := range forwards {
 		l.listener.Close()
@@ -119,6 +132,7 @@ func setupTestServer(t *testing.T, domain string, usePath bool) *integrationTest
 		sshTunnelListenersLock.Lock()
 		sshTunnelListeners = make(map[string]sshTunnelsListenerData)
 		sshTunnelListenersLock.Unlock()
+		httpBindPort = prevHTTPBindPort
 	})
 
 	return &integrationTestSetup{
@@ -533,7 +547,7 @@ func TestHTTPTunnel_TunnelNameCollision(t *testing.T) {
 	sshTunnelListenersLock.RLock()
 	for k, v := range sshTunnelListeners {
 		if v.clientID == "clientb" {
-			bName = strings.TrimPrefix(k, "127.0.0.1:0")
+			bName = strings.TrimPrefix(k, fmt.Sprintf("127.0.0.1:%d", httpBindPort))
 			break
 		}
 	}
@@ -571,5 +585,111 @@ func TestHTTPTunnel_TunnelNameCollision(t *testing.T) {
 	respB.Body.Close()
 	if string(bodyB) != "B" {
 		t.Fatalf("%s should route to B, got %q", bName, bodyB)
+	}
+}
+
+// HTTP/HTTPS tunnels do not allow a caller-chosen remote bind port; the
+// server pins the listener to --httpPort. Anything other than 0 (or the
+// matching httpBindPort) must be rejected with a clear error rather than
+// silently accepted as a TCP forward.
+func TestHTTPTunnel_RejectsCustomRemotePort(t *testing.T) {
+	setup := setupTestServer(t, "http://test.localhost", false)
+
+	cfg := &ssh.ClientConfig{
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(setup.clientKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+	client, err := ssh.Dial("tcp", setup.sshAddr, cfg)
+	if err != nil {
+		t.Fatalf("ssh dial: %v", err)
+	}
+	defer client.Close()
+
+	ch, chReqs, err := client.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("open session: %v", err)
+	}
+	go ssh.DiscardRequests(chReqs)
+	go io.Copy(io.Discard, ch)
+
+	execPayload := struct{ Command string }{Command: "id=t,tunnelname=hello,type=http"}
+	if _, err := ch.SendRequest("exec", false, ssh.Marshal(&execPayload)); err != nil {
+		t.Fatalf("send exec: %v", err)
+	}
+
+	type fwdReq struct {
+		BindAddr string
+		BindPort uint32
+	}
+	// 800 is neither 0 nor httpBindPort; server must reject.
+	ok, reply, err := client.SendRequest("tcpip-forward", true, ssh.Marshal(&fwdReq{BindAddr: "127.0.0.1", BindPort: 800}))
+	if err != nil {
+		t.Fatalf("send tcpip-forward: %v", err)
+	}
+	if ok {
+		t.Fatalf("tcpip-forward with custom HTTP port should have been rejected")
+	}
+	if !strings.Contains(string(reply), "HTTP/HTTPS tunnels do not accept a custom remote port") {
+		t.Fatalf("expected rejection message, got %q", string(reply))
+	}
+}
+
+// Disconnect cleanup must purge the tunnelName entry so a fresh client
+// (different clientID) can reclaim the same name. Reproduces the bug where
+// hitting Ctrl+C left "Specified tunnelName 'X' already taken" on the next
+// run because the cache key built at disconnect did not match the key under
+// which the entry was stored.
+func TestHTTPTunnel_NameReclaimableAfterDisconnect(t *testing.T) {
+	setup := setupTestServer(t, "http://test.localhost", false)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+
+	// Client 1 registers 'hello'.
+	tcA := connectAndRegister(t, setup, "id=clienta,tunnelname=hello,type=http", "127.0.0.1", handler, nil)
+
+	sshTunnelListenersLock.RLock()
+	preKey := fmt.Sprintf("127.0.0.1:%dhello", httpBindPort)
+	if _, ok := sshTunnelListeners[preKey]; !ok {
+		sshTunnelListenersLock.RUnlock()
+		t.Fatalf("registration missing: expected key %q", preKey)
+	}
+	sshTunnelListenersLock.RUnlock()
+
+	// Simulate Ctrl+C: close client 1's SSH connection. The server's
+	// handleIncomingSSHConn defer should purge sshTunnelListeners[hello].
+	tcA.sshClient.Close()
+
+	// Wait briefly for the server's defer to run.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		sshTunnelListenersLock.RLock()
+		_, stillThere := sshTunnelListeners[preKey]
+		sshTunnelListenersLock.RUnlock()
+		if !stillThere {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	sshTunnelListenersLock.RLock()
+	if _, stillThere := sshTunnelListeners[preKey]; stillThere {
+		sshTunnelListenersLock.RUnlock()
+		t.Fatalf("tunnelName entry not cleaned up after disconnect (key %q still present)", preKey)
+	}
+	sshTunnelListenersLock.RUnlock()
+
+	// Client 2 (different clientID) should be able to claim 'hello' again.
+	connectAndRegister(t, setup, "id=clientb,tunnelname=hello,type=http", "127.0.0.1", handler, nil)
+
+	sshTunnelListenersLock.RLock()
+	defer sshTunnelListenersLock.RUnlock()
+	entry, ok := sshTunnelListeners[preKey]
+	if !ok {
+		t.Fatalf("client B failed to claim 'hello' after client A's disconnect")
+	}
+	if entry.clientID != "clientb" {
+		t.Fatalf("expected entry to belong to clientb, got %q", entry.clientID)
 	}
 }

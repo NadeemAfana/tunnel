@@ -86,6 +86,13 @@ func main() {
 	// Spin up pprof endpoints at port 6060
 	pprofPtr := flag.Int("pprof", 0, "port number to spin up pprof endpoints for. Useful for debugging and troubleshooting.")
 
+	// --httpPort=3000
+	// TCP port on which the server listens for incoming HTTP/HTTPS tunnel
+	// traffic. Defaults to 3000 so the binary can run as an unprivileged user
+	// (ports < 1024 require CAP_NET_BIND_SERVICE on Linux). Front this with a
+	// reverse proxy (ALB, Nginx, etc.) on 80/443 if you want clean URLs.
+	httpPortPtr := flag.Int("httpPort", 3000, "TCP port to listen on for incoming HTTP/HTTPS tunnel traffic.")
+
 	// --genAdminHash: utility mode. Reads a passphrase from stdin, prints the
 	// bcrypt hash, and exits. Used to bootstrap the admin_passphrase_bcrypt
 	// env var without external tools.
@@ -112,6 +119,11 @@ func main() {
 	if domainPathPtr != nil {
 		domainPath = *domainPathPtr
 	}
+
+	if *httpPortPtr <= 0 || *httpPortPtr >= 1<<16 {
+		log.Fatalf("--httpPort=%d is out of range (1-65535)", *httpPortPtr)
+	}
+	httpBindPort = uint32(*httpPortPtr)
 
 	log.SetOutput(os.Stdout)
 

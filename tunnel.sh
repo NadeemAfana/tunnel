@@ -1,20 +1,17 @@
 #!/bin/bash
-# Creates a TCP or HTTP tunnel between this machine and remote $TUNNEL_DOMAIN.
+# Creates a TCP, UDP or HTTP tunnel between this machine and remote $TUNNEL_DOMAIN.
 #
 # NOTES:
 # The script re-launches ssh when it dies to reconnect automatically.
 # It uses an unbuffered pipe to keep the output on screen.
-# The SSH server takes the following arguments in the format key=value separated by a comma (eg tunnelName=abc,id=19417814394)
-# The values are:
-#           tunnelName: Optional. The tunnel Name (eg subdomain) to use if available. If not specified, the server will use a random name. (HTTP only)
-#           header:     Optional. Overrides the HOST header name when executing the HTTP request (HTTP only)
-#           id:         Optional. Random string to identify the client session. This is useful for reclaiming the tunnelName in case of transient
-#                       network errors. Otherwise, when the SSH client reconnects, it will use a different tunnelName.
 
 # Adjust the following values to match the server's
 sshPort=5223              # server's SSH listening port
-serverHttpBindingPort=80  # server's local binding port that listens for incoming HTTP requests
-serverBindingPort=0       # server's local binding port for TCP/UDP. 0 means allocate a random port from the server.
+# Default remote bind port when -p is not given. 0 means "let the server pick".
+# For HTTP/HTTPS the server pins the listener to its operator-configured
+# --httpPort, so the value here is irrelevant for HTTP and the server rejects
+# any non-zero/non-matching value. For TCP/UDP, 0 yields a random free port.
+serverBindingPort=0
 # Default URL for auto-downloading the udp-bridge helper. Honors a pre-set
 # TUNNEL_BRIDGE_URL from the environment so users can pin a specific release
 # or point at a different repo without editing this script.
@@ -54,8 +51,10 @@ printHelp () {
   printf "  %-25s Use this if you expect to keep the same tunnelName\n"
   printf "  %-25s after network disconnects.\n"
   printf "  %-25s Overrides the HOST header with the specified value.\n"  "-h, --host HOST"
-  printf "  %-25s Uses the specified PORT to listen at on the server\n"  "-p, --remote-port PORT"
-  printf "  %-25s side. Defaults to 80 for HTTP.\n"
+  printf "  %-25s Server-side remote port for TCP/UDP tunnels.\n"  "-p, --remote-port PORT"
+  printf "  %-25s Defaults to 0 (server-allocated). Not valid for HTTP/HTTPS:\n"
+  printf "  %-25s the server pins HTTP traffic to its --httpPort and rejects\n"
+  printf "  %-25s a custom port with a clear error.\n"
 
   printf "  %-25s Display this help and exit\n"  "-help, --help"
   printf '\nUDP mode\n'
@@ -432,13 +431,12 @@ if [[ $key  ]]; then
   sshCliArgs="$sshCliArgs -i $key"
 fi
 
-# Type-aware default for remotePort if -p wasn't given.
+# Default remotePort if -p wasn't given. 0 = "let the server decide": for
+# HTTP/HTTPS the server pins to --httpPort; for TCP/UDP it allocates a random
+# free port. The server rejects a non-zero remotePort for HTTP/HTTPS with a
+# clear message, so passing -p with --http surfaces a server-side error.
 if [[ -z "$remotePort" ]]; then
-  if [[ "$httpPort" = true ]]; then
-    remotePort=$serverHttpBindingPort
-  else
-    remotePort=$serverBindingPort
-  fi
+  remotePort=$serverBindingPort
 fi
 
 # For debugging
@@ -451,7 +449,6 @@ if [[ "$debug" = true ]]; then
   printf "  %-25s $TUNNEL_DOMAIN\n"  "domain"
   printf "  %-25s $tunnelName\n"  "tunnelName"
   printf "  %-25s $sshPort\n"  "sshPort"
-  printf "  %-25s $serverHttpBindingPort\n"  "serverHttpBindingPort"
   printf "  %-25s $serverBindingPort\n"  "serverBindingPort"
   printf "  %-25s $overrideHeaderHost\n"  "overrideHeaderHost"
   printf "  %-25s $sshCliArgs\n"  "sshCliArgs"
