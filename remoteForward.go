@@ -34,7 +34,7 @@ func formatTunnelLine(from, localTarget string) string {
 
 const bufferSize = 32 << 10 // 32 kB buffer.
 var bufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buffer := make([]byte, bufferSize)
 		return &buffer
 	},
@@ -114,6 +114,18 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	if clientID == "" {
 		log.Printf("id empty setting equal to session id %s", hex.EncodeToString(conn.SessionID()))
 		clientID = hex.EncodeToString(conn.SessionID())
+	}
+
+	// Authenticated identity from PublicKeyCallback. Used as the per-user
+	// quota key in the port registry and for audit logging. Falls back to
+	// sessionID if the auth layer somehow did not set it (defense-in-depth;
+	// this should not happen in practice).
+	owner := ""
+	if conn.Permissions != nil {
+		owner = conn.Permissions.Extensions["key-name"]
+	}
+	if owner == "" {
+		owner = "session-" + hex.EncodeToString(conn.SessionID())
 	}
 
 	// For HTTP/HTTPS, the public port is server-controlled (httpBindPort) and
@@ -256,23 +268,45 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		requestBindPort := int(reqPayload.BindPort)
 
 		if requestBindPort == 0 {
-			udpConn, err = net.ListenPacket("udp", net.JoinHostPort(reqPayload.BindAddr, "0"))
-			if err != nil {
-				log.Printf("error listening for UDP at %s:0: %s", reqPayload.BindAddr, err)
-				return false, []byte{}
+			// Pick a free UDP port from the registry, retry on rare kernel
+			// collision (some other process grabbed it for outbound between
+			// our reserve and our listen).
+			const maxBindRetries = 8
+			for retry := 0; retry < maxBindRetries; retry++ {
+				p, allocErr := ports.allocate(owner, protoUDP)
+				if allocErr != nil {
+					io.WriteString(session.channel, fmt.Sprintf("%s\n", allocErr))
+					return false, []byte(allocErr.Error())
+				}
+				tryAddr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(p)))
+				c, lerr := net.ListenPacket("udp", tryAddr)
+				if lerr != nil {
+					log.Printf("UDP bind retry: %s: %s", tryAddr, lerr)
+					ports.release(p, protoUDP)
+					continue
+				}
+				udpConn = c
+				requestBindPort = int(p)
+				reqPayload.BindPort = p
+				addr = tryAddr
+				break
 			}
-			_, portStr, _ := net.SplitHostPort(udpConn.LocalAddr().String())
-			p, _ := strconv.Atoi(portStr)
-			requestBindPort = p
-			reqPayload.BindPort = uint32(p)
-			addr = net.JoinHostPort(reqPayload.BindAddr, portStr)
+			if udpConn == nil {
+				msg := "could not allocate a free UDP port; range may be saturated"
+				io.WriteString(session.channel, msg+"\n")
+				return false, []byte(msg)
+			}
 		} else {
+			// Caller-specified port. Same-clientID takeover allowed; otherwise
+			// validate against the registry (range / already-in-use / per-user
+			// limit) before binding.
 			forwardsLock.Lock()
 			if existing, ok := forwards[addr]; ok {
 				if existing.clientID == clientID {
 					log.Printf("Discarding existing UDP forward for same client id %s", clientID)
 					existing.listener.Close()
 					delete(forwards, addr)
+					ports.release(uint32(requestBindPort), protoUDP)
 				} else {
 					forwardsLock.Unlock()
 					io.WriteString(session.channel, fmt.Sprintf("UDP port %d is already taken.\n", reqPayload.BindPort))
@@ -281,10 +315,17 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 			}
 			forwardsLock.Unlock()
 
+			if rerr := ports.reserve(uint32(requestBindPort), owner, protoUDP); rerr != nil {
+				io.WriteString(session.channel, fmt.Sprintf("UDP port %d: %s\n", requestBindPort, rerr))
+				return false, []byte(rerr.Error())
+			}
+
 			udpConn, err = net.ListenPacket("udp", addr)
 			if err != nil {
+				ports.release(uint32(requestBindPort), protoUDP)
 				log.Printf("error listening for UDP address %s: %s", addr, err)
-				return false, []byte{}
+				io.WriteString(session.channel, fmt.Sprintf("UDP listen %s: %s\n", addr, err))
+				return false, []byte(err.Error())
 			}
 		}
 
@@ -311,27 +352,47 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 	requestBindPort := int(reqPayload.BindPort)
 
 	if requestBindPort == 0 {
-		// Let the kernel pick a free port atomically — no need to hold
-		// forwardsLock across a scan. The bound address is what we register.
-		ln, err = net.Listen("tcp", net.JoinHostPort(reqPayload.BindAddr, "0"))
-		if err != nil {
-			log.Printf("error listening for TCP at %s:0: %s", reqPayload.BindAddr, err)
-			return false, []byte{}
+		// Pick a free TCP port from the registry (which enforces the
+		// per-user quota and avoids ports we already handed out). Retry
+		// on rare kernel-level collision: another process on the box may
+		// have grabbed the port for an outbound connection between our
+		// reserve and our listen.
+		const maxBindRetries = 8
+		for retry := 0; retry < maxBindRetries; retry++ {
+			p, allocErr := ports.allocate(owner, protoTCP)
+			if allocErr != nil {
+				io.WriteString(session.channel, fmt.Sprintf("%s\n", allocErr))
+				return false, []byte(allocErr.Error())
+			}
+			tryAddr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(p)))
+			l, lerr := net.Listen("tcp", tryAddr)
+			if lerr != nil {
+				log.Printf("TCP bind retry: %s: %s", tryAddr, lerr)
+				ports.release(p, protoTCP)
+				continue
+			}
+			ln = l
+			requestBindPort = int(p)
+			reqPayload.BindPort = p
+			addr = tryAddr
+			break
 		}
-		_, portStr, _ := net.SplitHostPort(ln.Addr().String())
-		p, _ := strconv.Atoi(portStr)
-		requestBindPort = p
-		reqPayload.BindPort = uint32(p)
-		addr = net.JoinHostPort(reqPayload.BindAddr, portStr)
+		if ln == nil {
+			msg := "could not allocate a free TCP port; range may be saturated"
+			io.WriteString(session.channel, msg+"\n")
+			return false, []byte(msg)
+		}
 	} else {
-		// Caller-specified port. Briefly lock only to check for an existing
-		// same-client takeover, then release before the listen syscall.
+		// Caller-specified port. Same-clientID takeover is allowed; otherwise
+		// validate against the registry (range / already-in-use / per-user
+		// limit) before binding.
 		forwardsLock.Lock()
 		if existing, ok := forwards[addr]; ok {
 			if existing.clientID == clientID {
 				log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
 				existing.listener.Close()
 				delete(forwards, addr)
+				ports.release(uint32(requestBindPort), protoTCP)
 			} else {
 				forwardsLock.Unlock()
 				io.WriteString(session.channel, fmt.Sprintf("TCP port %d is already taken.\n", reqPayload.BindPort))
@@ -340,10 +401,17 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 		}
 		forwardsLock.Unlock()
 
+		if rerr := ports.reserve(uint32(requestBindPort), owner, protoTCP); rerr != nil {
+			io.WriteString(session.channel, fmt.Sprintf("TCP port %d: %s\n", requestBindPort, rerr))
+			return false, []byte(rerr.Error())
+		}
+
 		ln, err = net.Listen("tcp", addr)
 		if err != nil {
+			ports.release(uint32(requestBindPort), protoTCP)
 			log.Printf("error listening for TCP address %s: %s", addr, err)
-			return false, []byte{}
+			io.WriteString(session.channel, fmt.Sprintf("TCP listen %s: %s\n", addr, err))
+			return false, []byte(err.Error())
 		}
 	}
 
@@ -670,13 +738,18 @@ func cancelForwardHandler(conn *sshConnection, req *ssh.Request, ctx context.Con
 		return true, nil
 	}
 	// TCP/UDP: closing the listener (or PacketConn) makes the per-forward
-	// goroutine exit and remove itself from the forwards map.
+	// goroutine exit. Also release the registry slot so the user's quota and
+	// the port itself are immediately reusable.
 	addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
 	forwardsLock.Lock()
 	lnO, ok := forwards[addr]
+	if ok {
+		delete(forwards, addr)
+	}
 	forwardsLock.Unlock()
 	if ok {
 		lnO.listener.Close()
+		releasePortFromRegistry(addr, lnO.conType)
 	}
 	return true, nil
 }

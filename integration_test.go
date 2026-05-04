@@ -78,6 +78,11 @@ func setupTestServer(t *testing.T, domain string, usePath bool) *integrationTest
 	httpBindPort = uint32(preLn.Addr().(*net.TCPAddr).Port)
 	preLn.Close()
 
+	// Fresh port registry per test with a generous limit. Tests that exercise
+	// the per-user cap construct their own narrower registry inline.
+	prevPorts := ports
+	ports = newPortRegistry(20000, 65000, 1000)
+
 	forwardsLock.Lock()
 	for _, l := range forwards {
 		l.listener.Close()
@@ -96,7 +101,14 @@ func setupTestServer(t *testing.T, domain string, usePath bool) *integrationTest
 		PublicKeyCallback: func(c ssh.ConnMetadata, pub ssh.PublicKey) (*ssh.Permissions, error) {
 			if authorizedKeys[string(pub.Marshal())] {
 				return &ssh.Permissions{
-					Extensions: map[string]string{"pubkey-fp": ssh.FingerprintSHA256(pub)},
+					Extensions: map[string]string{
+						"pubkey-fp": ssh.FingerprintSHA256(pub),
+						// Stable test owner so per-user counters in the port
+						// registry attribute every connection here to the
+						// same identity (production sets this from the
+						// authorized_keys.json `name` field).
+						"key-name": "test-user",
+					},
 				}, nil
 			}
 			return nil, fmt.Errorf("unknown key")
@@ -133,6 +145,7 @@ func setupTestServer(t *testing.T, domain string, usePath bool) *integrationTest
 		sshTunnelListeners = make(map[string]sshTunnelsListenerData)
 		sshTunnelListenersLock.Unlock()
 		httpBindPort = prevHTTPBindPort
+		ports = prevPorts
 	})
 
 	return &integrationTestSetup{
@@ -691,5 +704,71 @@ func TestHTTPTunnel_NameReclaimableAfterDisconnect(t *testing.T) {
 	}
 	if entry.clientID != "clientb" {
 		t.Fatalf("expected entry to belong to clientb, got %q", entry.clientID)
+	}
+}
+
+// Per-user port quota: with maxPerUser=3, the 4th TCP forward from the same
+// authenticated key must be rejected with errUserPortLimit. Exercises the
+// portRegistry integration end-to-end through the SSH protocol path.
+func TestTCPTunnel_PerUserPortLimit(t *testing.T) {
+	setup := setupTestServer(t, "http://test.localhost", false)
+
+	// Replace the registry with one capped at 3 ports for this test.
+	ports = newPortRegistry(20000, 65000, 3)
+
+	cfg := &ssh.ClientConfig{
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(setup.clientKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+
+	type fwdReq struct {
+		BindAddr string
+		BindPort uint32
+	}
+
+	// Helper: dial a fresh SSH connection (mirroring tunnel.sh, which opens
+	// one connection per invocation), send exec + tcpip-forward, return the
+	// forward reply. Keeps the connection alive via the *ssh.Client return so
+	// the listener stays bound and counted in the registry until the test
+	// ends. tunnel.Close() in t.Cleanup releases everything.
+	openTCPForward := func(idSuffix string) (*ssh.Client, bool, []byte) {
+		client, err := ssh.Dial("tcp", setup.sshAddr, cfg)
+		if err != nil {
+			t.Fatalf("ssh dial: %v", err)
+		}
+		t.Cleanup(func() { client.Close() })
+
+		ch, chReqs, err := client.OpenChannel("session", nil)
+		if err != nil {
+			t.Fatalf("open session: %v", err)
+		}
+		go ssh.DiscardRequests(chReqs)
+		go io.Copy(io.Discard, ch)
+		execPayload := struct{ Command string }{Command: "id=" + idSuffix + ",type=tcp"}
+		if _, err := ch.SendRequest("exec", false, ssh.Marshal(&execPayload)); err != nil {
+			t.Fatalf("send exec: %v", err)
+		}
+		ok, reply, err := client.SendRequest("tcpip-forward", true, ssh.Marshal(&fwdReq{BindAddr: "127.0.0.1", BindPort: 0}))
+		if err != nil {
+			t.Fatalf("send tcpip-forward: %v", err)
+		}
+		return client, ok, reply
+	}
+
+	for i := 0; i < 3; i++ {
+		_, ok, reply := openTCPForward(fmt.Sprintf("c%d", i))
+		if !ok {
+			t.Fatalf("forward %d should succeed, got reject: %s", i+1, string(reply))
+		}
+	}
+	// 4th must hit the per-user limit.
+	_, ok, reply := openTCPForward("c3")
+	if ok {
+		t.Fatalf("4th forward should have been rejected by per-user limit")
+	}
+	if !strings.Contains(string(reply), "per-user port limit") {
+		t.Fatalf("expected per-user port limit error, got %q", string(reply))
 	}
 }

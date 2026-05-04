@@ -396,6 +396,10 @@ start_bridge () {
   fi
 
   echo "udp-bridge listening on $bridgeAddr -> $localHostPort"
+  # Preserve the user's actual UDP target so the server-side "Tunneling …"
+  # message can show it instead of the internal bridge port. Used when
+  # building sshServerArgs below.
+  userLocalTarget="$localHostPort"
   # Re-point ssh -R at the bridge's TCP port, not the UDP service.
   localHostPort="$bridgeAddr"
 
@@ -422,7 +426,7 @@ fi
 # Use uuidgen (works on Linux + macOS) with /proc fallback for stripped-down
 # Linux containers that may have neither uuidgen nor util-linux.
 sshClientID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
-sshServerArgs="tunnelName=$tunnelName,type=$type,header=$overrideHeaderHost,id=$sshClientID,localTarget=$localHostPort"
+sshServerArgs="tunnelName=$tunnelName,type=$type,header=$overrideHeaderHost,id=$sshClientID,localTarget=${userLocalTarget:-$localHostPort}"
 
 # Extra args to pass to SSH cli
 sshCliArgs=" -o ConnectionAttempts=$((10**4))  -o ServerAliveInterval=20 -o ServerAliveCountMax=2"

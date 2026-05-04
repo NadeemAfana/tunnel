@@ -62,6 +62,12 @@ var authorizedKeysLock sync.RWMutex
 // env var. If empty, admin commands are disabled.
 var adminPassphraseHash []byte
 
+// Global TCP/UDP port registry. Initialized from --portMin / --portMax /
+// --maxPortsPerUser at startup; nil during very early init and in tests that
+// don't go through main(). Tests in this package replace it via
+// setupTestServer.
+var ports *portRegistry
+
 func init() {
 	forwards = make(map[string]forwardsListenerData)
 	sshTunnelListeners = make(map[string]sshTunnelsListenerData)
@@ -92,6 +98,15 @@ func main() {
 	// (ports < 1024 require CAP_NET_BIND_SERVICE on Linux). Front this with a
 	// reverse proxy (ALB, Nginx, etc.) on 80/443 if you want clean URLs.
 	httpPortPtr := flag.Int("httpPort", 3000, "TCP port to listen on for incoming HTTP/HTTPS tunnel traffic.")
+
+	// --portMin / --portMax: shared TCP+UDP port range for per-tunnel
+	// listeners. Above the kernel's privileged range (1024) so the non-root
+	// container can bind. The default upper bound overlaps the Linux ephemeral
+	// range (32768-60999), which is fine because the server picks ports from
+	// its own registry; on rare kernel collisions the bind retries.
+	portMinPtr := flag.Int("portMin", 10000, "Minimum TCP/UDP remote port for tunnels (inclusive).")
+	portMaxPtr := flag.Int("portMax", 59999, "Maximum TCP/UDP remote port for tunnels (inclusive).")
+	maxPortsPerUserPtr := flag.Int("maxPortsPerUser", 30, "Maximum simultaneous TCP/UDP tunnels per authenticated key (combined across protocols).")
 
 	// --genAdminHash: utility mode. Reads a passphrase from stdin, prints the
 	// bcrypt hash, and exits. Used to bootstrap the admin_passphrase_bcrypt
@@ -124,6 +139,14 @@ func main() {
 		log.Fatalf("--httpPort=%d is out of range (1-65535)", *httpPortPtr)
 	}
 	httpBindPort = uint32(*httpPortPtr)
+
+	if *portMinPtr < 1 || *portMaxPtr >= 1<<16 || *portMinPtr > *portMaxPtr {
+		log.Fatalf("invalid TCP/UDP port range [%d, %d]", *portMinPtr, *portMaxPtr)
+	}
+	if *maxPortsPerUserPtr < 1 {
+		log.Fatalf("--maxPortsPerUser must be >= 1; got %d", *maxPortsPerUserPtr)
+	}
+	ports = newPortRegistry(uint32(*portMinPtr), uint32(*portMaxPtr), *maxPortsPerUserPtr)
 
 	log.SetOutput(os.Stdout)
 
@@ -339,6 +362,7 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 			if ok && o.sessionID == sessionID {
 				delete(forwards, addr)
 				o.listener.Close()
+				releasePortFromRegistry(addr, o.conType)
 				log.Printf("Purged %s forward cache for session %s @ %s", o.conType, o.sessionID, addr)
 			}
 			forwardsLock.Unlock()
