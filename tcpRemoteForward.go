@@ -69,27 +69,8 @@ func setupTCPForward(sc *forwardSetupContext) (bool, []byte) {
 			return false, []byte(msg)
 		}
 	} else {
-		// Caller-specified port. Same-clientID takeover is allowed; otherwise
-		// validate against the registry (range / already-in-use / per-user
-		// limit) before binding.
-		forwardsLock.Lock()
-		if existing, ok := forwards[addr]; ok {
-			if existing.clientID == clientID {
-				log.Printf("Discarding existing tunnelName cache for same client id %s", clientID)
-				existing.listener.Close()
-				delete(forwards, addr)
-				ports.release(uint32(requestBindPort), protoTCP)
-			} else {
-				forwardsLock.Unlock()
-				io.WriteString(session.channel, fmt.Sprintf("TCP port %d is already taken.\n", reqPayload.BindPort))
-				return false, []byte{}
-			}
-		}
-		forwardsLock.Unlock()
-
-		if rerr := ports.reserve(uint32(requestBindPort), owner, protoTCP); rerr != nil {
-			io.WriteString(session.channel, fmt.Sprintf("TCP port %d: %s\n", requestBindPort, rerr))
-			return false, []byte(rerr.Error())
+		if ok, payload := acquireExplicitPort(sc, protoTCP); !ok {
+			return false, payload
 		}
 
 		ln, err = net.Listen("tcp", addr)

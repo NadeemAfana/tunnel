@@ -32,6 +32,60 @@ func formatTunnelLine(from, localTarget string) string {
 	return fmt.Sprintf("Tunneling %s -> %s\n", from, localTarget)
 }
 
+// acquireExplicitPort handles the caller-specified port path shared by TCP
+// and UDP setup. It locks forwardsLock, performs same-client takeover if the
+// existing entry's clientID matches, and reserves the registry slot if no
+// takeover happened. On takeover the slot is intentionally NOT released and
+// re-reserved: same client reclaiming the same port keeps the same owner
+// accounted for, and the previous release/re-reserve dance opened a TOCTOU
+// window where another client could grab the slot in between.
+//
+// Returns ok=true to proceed. ok=false means the caller should return
+// (false, payload) from its setup function; the user-facing message has
+// already been written to sc.session.channel.
+func acquireExplicitPort(sc *forwardSetupContext, proto netProto) (ok bool, payload []byte) {
+	var label string
+	switch proto {
+	case protoTCP:
+		label = "TCP"
+	case protoUDP:
+		label = "UDP"
+	}
+	requestBindPort := int(sc.reqPayload.BindPort)
+
+	var oldListener io.Closer
+	tookOver := false
+	forwardsLock.Lock()
+	if existing, exists := forwards[sc.addr]; exists {
+		if existing.clientID == sc.clientID {
+			log.Printf("Discarding existing %s forward for same client id %s", label, sc.clientID)
+			oldListener = existing.listener
+			delete(forwards, sc.addr)
+			tookOver = true
+		} else {
+			forwardsLock.Unlock()
+			io.WriteString(sc.session.channel, fmt.Sprintf("%s port %d is already taken.\n", label, sc.reqPayload.BindPort))
+			return false, []byte{}
+		}
+	}
+	forwardsLock.Unlock()
+
+	// Close the previous listener after releasing forwardsLock. Close is a
+	// syscall and we don't want to block other forwardsLock acquirers (TCP/UDP
+	// setup, cancel, disconnect cleanup) for its duration.
+	if oldListener != nil {
+		oldListener.Close()
+	}
+
+	if !tookOver {
+		if rerr := ports.reserve(uint32(requestBindPort), sc.owner, proto); rerr != nil {
+			io.WriteString(sc.session.channel, fmt.Sprintf("%s port %d: %s\n", label, requestBindPort, rerr))
+			return false, []byte(rerr.Error())
+		}
+	}
+	return true, nil
+}
+
 // forwardSetupContext carries the parsed and validated state from
 // forwardHandler down to the per-protocol setup helpers
 // (setupHTTPForward / setupTCPForward / setupUDPForward).
@@ -239,12 +293,18 @@ func cancelForwardHandler(conn *sshConnection, req *ssh.Request, ctx context.Con
 	}
 	// TCP/UDP: closing the listener (or PacketConn) makes the per-forward
 	// goroutine exit. Also release the registry slot so the user's quota and
-	// the port itself are immediately reusable.
+	// the port itself are immediately reusable. Only act if this connection
+	// actually owns the forward. Otherwise any authenticated client could
+	// tear down another client's forward by sending cancel-tcpip-forward
+	// with someone else's bound addr+port.
 	addr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(reqPayload.BindPort)))
+	sessionID := hex.EncodeToString(conn.SessionID())
 	forwardsLock.Lock()
 	lnO, ok := forwards[addr]
-	if ok {
+	if ok && lnO.sessionID == sessionID {
 		delete(forwards, addr)
+	} else {
+		ok = false
 	}
 	forwardsLock.Unlock()
 	if ok {

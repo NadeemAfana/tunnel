@@ -772,3 +772,206 @@ func TestTCPTunnel_PerUserPortLimit(t *testing.T) {
 		t.Fatalf("expected per-user port limit error, got %q", string(reply))
 	}
 }
+
+// TestTCPTunnel_CancelRequiresOwnership verifies that cancel-tcpip-forward
+// only tears down a forward when the requesting connection actually owns it.
+// Without the sessionID guard in cancelForwardHandler, any authenticated
+// client could send a cancel for someone else's bound addr+port and remove
+// it. UDP goes through the same handler branch, so this also covers UDP.
+func TestTCPTunnel_CancelRequiresOwnership(t *testing.T) {
+	setup := setupTestServer(t, "http://test.localhost", false)
+
+	cfg := &ssh.ClientConfig{
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(setup.clientKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+
+	type fwdReq struct {
+		BindAddr string
+		BindPort uint32
+	}
+	type fwdReply struct {
+		BindPort uint32
+	}
+
+	openForward := func(idSuffix string) (*ssh.Client, uint32) {
+		client, err := ssh.Dial("tcp", setup.sshAddr, cfg)
+		if err != nil {
+			t.Fatalf("ssh dial: %v", err)
+		}
+		t.Cleanup(func() { client.Close() })
+		ch, chReqs, err := client.OpenChannel("session", nil)
+		if err != nil {
+			t.Fatalf("open session: %v", err)
+		}
+		go ssh.DiscardRequests(chReqs)
+		go io.Copy(io.Discard, ch)
+		execPayload := struct{ Command string }{Command: "id=" + idSuffix + ",type=tcp"}
+		if _, err := ch.SendRequest("exec", false, ssh.Marshal(&execPayload)); err != nil {
+			t.Fatalf("send exec: %v", err)
+		}
+		ok, reply, err := client.SendRequest("tcpip-forward", true, ssh.Marshal(&fwdReq{BindAddr: "127.0.0.1", BindPort: 0}))
+		if err != nil {
+			t.Fatalf("send tcpip-forward: %v", err)
+		}
+		if !ok {
+			t.Fatalf("tcpip-forward rejected: %s", string(reply))
+		}
+		var fr fwdReply
+		if err := ssh.Unmarshal(reply, &fr); err != nil {
+			t.Fatalf("unmarshal fwd reply: %v", err)
+		}
+		return client, fr.BindPort
+	}
+
+	clientA, port := openForward("clientA")
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	forwardsLock.Lock()
+	_, present := forwards[addr]
+	forwardsLock.Unlock()
+	if !present {
+		t.Fatalf("expected forwards[%s] to be registered after A bound it", addr)
+	}
+
+	clientB, err := ssh.Dial("tcp", setup.sshAddr, cfg)
+	if err != nil {
+		t.Fatalf("ssh dial B: %v", err)
+	}
+	t.Cleanup(func() { clientB.Close() })
+
+	type cancelReq struct {
+		BindAddr string
+		BindPort uint32
+	}
+	if _, _, err := clientB.SendRequest("cancel-tcpip-forward", true, ssh.Marshal(&cancelReq{BindAddr: "127.0.0.1", BindPort: port})); err != nil {
+		t.Fatalf("B cancel: %v", err)
+	}
+
+	// The handler returns true regardless to avoid leaking which ports are
+	// bound. The security property is whether A's forward survives.
+	forwardsLock.Lock()
+	_, stillPresent := forwards[addr]
+	forwardsLock.Unlock()
+	if !stillPresent {
+		t.Fatalf("forwards[%s] was torn down by an unauthorized cancel from a different session", addr)
+	}
+
+	// Positive control: A's own cancel must succeed and remove the entry.
+	okA, _, err := clientA.SendRequest("cancel-tcpip-forward", true, ssh.Marshal(&cancelReq{BindAddr: "127.0.0.1", BindPort: port}))
+	if err != nil {
+		t.Fatalf("A cancel: %v", err)
+	}
+	if !okA {
+		t.Fatalf("A's own cancel should have succeeded")
+	}
+	forwardsLock.Lock()
+	_, gone := forwards[addr]
+	forwardsLock.Unlock()
+	if gone {
+		t.Fatalf("forwards[%s] should have been removed by A's own cancel", addr)
+	}
+}
+
+// TestTCPTunnel_SameClientTakeover verifies that a same-clientID reconnect
+// for an explicit port reclaims the existing forward and keeps the per-user
+// registry slot count stable (one owner, one slot held, despite two
+// connections). This exercises the acquireExplicitPort takeover path which
+// intentionally skips the release/re-reserve cycle.
+func TestTCPTunnel_SameClientTakeover(t *testing.T) {
+	setup := setupTestServer(t, "http://test.localhost", false)
+
+	cfg := &ssh.ClientConfig{
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(setup.clientKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+
+	type fwdReq struct {
+		BindAddr string
+		BindPort uint32
+	}
+	type fwdReply struct {
+		BindPort uint32
+	}
+
+	openForward := func(idSuffix string, bindPort uint32) (*ssh.Client, uint32, bool, []byte) {
+		client, err := ssh.Dial("tcp", setup.sshAddr, cfg)
+		if err != nil {
+			t.Fatalf("ssh dial: %v", err)
+		}
+		t.Cleanup(func() { client.Close() })
+		ch, chReqs, err := client.OpenChannel("session", nil)
+		if err != nil {
+			t.Fatalf("open session: %v", err)
+		}
+		go ssh.DiscardRequests(chReqs)
+		go io.Copy(io.Discard, ch)
+		execPayload := struct{ Command string }{Command: "id=" + idSuffix + ",type=tcp"}
+		if _, err := ch.SendRequest("exec", false, ssh.Marshal(&execPayload)); err != nil {
+			t.Fatalf("send exec: %v", err)
+		}
+		ok, reply, err := client.SendRequest("tcpip-forward", true, ssh.Marshal(&fwdReq{BindAddr: "127.0.0.1", BindPort: bindPort}))
+		if err != nil {
+			t.Fatalf("send tcpip-forward: %v", err)
+		}
+		if !ok {
+			return client, 0, false, reply
+		}
+		var fr fwdReply
+		if err := ssh.Unmarshal(reply, &fr); err != nil {
+			t.Fatalf("unmarshal fwd reply: %v", err)
+		}
+		return client, fr.BindPort, true, nil
+	}
+
+	// A binds an auto-allocated port (server picks one in [20000, 65000]).
+	_, port, ok, reply := openForward("clientFoo", 0)
+	if !ok {
+		t.Fatalf("A's first forward rejected: %s", string(reply))
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	forwardsLock.Lock()
+	entryA, present := forwards[addr]
+	forwardsLock.Unlock()
+	if !present {
+		t.Fatalf("forwards[%s] missing after A bound", addr)
+	}
+	sidA := entryA.sessionID
+
+	if got := ports.count("test-user"); got != 1 {
+		t.Fatalf("after A bind: expected 1 port held, got %d", got)
+	}
+
+	// A2 reuses clientID=clientFoo but a fresh SSH connection, asking for the
+	// same explicit port. Server should detect same-client takeover.
+	_, port2, ok2, reply2 := openForward("clientFoo", port)
+	if !ok2 {
+		t.Fatalf("A2 takeover rejected: %s", string(reply2))
+	}
+	if port2 != port {
+		t.Fatalf("A2 takeover bound %d, expected %d", port2, port)
+	}
+
+	forwardsLock.Lock()
+	entryA2, present := forwards[addr]
+	forwardsLock.Unlock()
+	if !present {
+		t.Fatalf("forwards[%s] missing after A2 takeover", addr)
+	}
+	if entryA2.sessionID == sidA {
+		t.Fatalf("forwards[%s].sessionID should have changed on takeover, got the same %s", addr, sidA)
+	}
+
+	// The key invariant the refactor preserves: per-user registry count is
+	// unchanged. Same owner reclaiming the same port should not bump the
+	// counter, and the previous release/re-reserve cycle should not leave a
+	// drained slot behind.
+	if got := ports.count("test-user"); got != 1 {
+		t.Fatalf("after takeover: expected 1 port held, got %d", got)
+	}
+}

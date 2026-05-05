@@ -162,27 +162,8 @@ func setupUDPForward(sc *forwardSetupContext) (bool, []byte) {
 			return false, []byte(msg)
 		}
 	} else {
-		// Caller-specified port. Same-clientID takeover allowed; otherwise
-		// validate against the registry (range / already-in-use / per-user
-		// limit) before binding.
-		forwardsLock.Lock()
-		if existing, ok := forwards[addr]; ok {
-			if existing.clientID == clientID {
-				log.Printf("Discarding existing UDP forward for same client id %s", clientID)
-				existing.listener.Close()
-				delete(forwards, addr)
-				ports.release(uint32(requestBindPort), protoUDP)
-			} else {
-				forwardsLock.Unlock()
-				io.WriteString(session.channel, fmt.Sprintf("UDP port %d is already taken.\n", reqPayload.BindPort))
-				return false, []byte{}
-			}
-		}
-		forwardsLock.Unlock()
-
-		if rerr := ports.reserve(uint32(requestBindPort), owner, protoUDP); rerr != nil {
-			io.WriteString(session.channel, fmt.Sprintf("UDP port %d: %s\n", requestBindPort, rerr))
-			return false, []byte(rerr.Error())
+		if ok, payload := acquireExplicitPort(sc, protoUDP); !ok {
+			return false, payload
 		}
 
 		udpConn, err = net.ListenPacket("udp", addr)

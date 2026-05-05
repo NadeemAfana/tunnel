@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -370,16 +371,24 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 
 		// Close every TCP/UDP listener bound by this session. A session may
 		// register more than one forward, so iterate everything tracked.
+		// Close and registry-release happen after dropping forwardsLock so a
+		// slow syscall does not block other forwardsLock acquirers.
 		for _, addr := range serverConnection.GetForwardAddrs() {
+			var toClose io.Closer
+			var conType connectionType
 			forwardsLock.Lock()
 			o, ok := forwards[addr]
 			if ok && o.sessionID == sessionID {
 				delete(forwards, addr)
-				o.listener.Close()
-				releasePortFromRegistry(addr, o.conType)
+				toClose = o.listener
+				conType = o.conType
 				log.Printf("Purged %s forward cache for session %s @ %s", o.conType, o.sessionID, addr)
 			}
 			forwardsLock.Unlock()
+			if toClose != nil {
+				toClose.Close()
+				releasePortFromRegistry(addr, conType)
+			}
 		}
 	}()
 

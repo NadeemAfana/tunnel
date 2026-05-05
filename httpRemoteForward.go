@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -141,25 +142,62 @@ func setupHTTPForward(sc *forwardSetupContext) (bool, []byte) {
 	return true, ssh.Marshal(&remoteForwardSuccess{uint32(destPort)})
 }
 
+// ensureHTTPServerLock serializes the slow path of ensureHTTPServer (the
+// net.Listen syscall) so concurrent first-time callers don't race the bind.
+// Steady-state callers skip this mutex entirely via the fast path below;
+// only a cache miss pays the serialization cost.
+var ensureHTTPServerLock sync.Mutex
+
+// validateExistingHTTPListener returns the listener stored at addr if it is
+// the HTTP server's listener. Rejects entries owned by TCP/UDP forwards.
+func validateExistingHTTPListener(addr string, existing forwardsListenerData) (net.Listener, error) {
+	// Gate on conType, not just the type assertion. A TCP forward also
+	// stores a net.Listener, so the assertion alone would happily return
+	// a TCP listener as if it were the HTTP server's listener. This only
+	// matters when httpBindPort falls inside [portMin, portMax] (an
+	// operator misconfiguration), but the guard is cheap.
+	if existing.conType != HTTPConnectionType {
+		return nil, fmt.Errorf("address %s is already bound by a non-HTTP listener (%s)", addr, existing.conType)
+	}
+	l, ok := existing.listener.(net.Listener)
+	if !ok {
+		return nil, fmt.Errorf("address %s registered as HTTP but listener is not a net.Listener", addr)
+	}
+	return l, nil
+}
+
 // ensureHTTPServer returns the shared HTTP listener for addr, starting one if
 // it does not yet exist. The http.Server services all tunnels bound to addr
 // and routes per-request by tunnelName (subdomain or URL path).
 func ensureHTTPServer(addr string, cancellationCtx context.Context) (net.Listener, error) {
+	// Fast path: listener already exists. No serialization mutex needed,
+	// just a brief forwardsLock acquire to read the map.
 	forwardsLock.Lock()
-	if existing, ok := forwards[addr]; ok {
-		forwardsLock.Unlock()
-		l, ok := existing.listener.(net.Listener)
-		if !ok {
-			return nil, fmt.Errorf("address %s is already bound by a non-HTTP listener (%s)", addr, existing.conType)
-		}
-		return l, nil
+	existing, ok := forwards[addr]
+	forwardsLock.Unlock()
+	if ok {
+		return validateExistingHTTPListener(addr, existing)
+	}
+
+	// Slow path: serialize so concurrent first-time callers don't race the
+	// net.Listen syscall. Re-check after acquiring the mutex in case another
+	// goroutine bound while we were waiting.
+	ensureHTTPServerLock.Lock()
+	defer ensureHTTPServerLock.Unlock()
+
+	forwardsLock.Lock()
+	existing, ok = forwards[addr]
+	forwardsLock.Unlock()
+	if ok {
+		return validateExistingHTTPListener(addr, existing)
 	}
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		forwardsLock.Unlock()
 		return nil, err
 	}
+
+	forwardsLock.Lock()
 	forwards[addr] = forwardsListenerData{listener: ln, conType: HTTPConnectionType}
 	forwardsLock.Unlock()
 
