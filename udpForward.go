@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -112,6 +113,102 @@ func readUDPFrame(r io.Reader, buf []byte) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// setupUDPForward binds a UDP packet listener for one tcpip-forward request.
+// Mirrors setupTCPForward: the registry validates a caller-specified port or
+// allocates a free one with retries on rare kernel-level collisions. The
+// per-flow channel model lives in runUDPListener.
+func setupUDPForward(sc *forwardSetupContext) (bool, []byte) {
+	conn := sc.conn
+	session := sc.session
+	reqPayload := sc.reqPayload
+	addr := sc.addr
+	clientID := sc.clientID
+	owner := sc.owner
+	cancellationCtx := sc.cancellationCtx
+
+	var udpConn net.PacketConn
+	var err error
+	requestBindPort := int(reqPayload.BindPort)
+
+	if requestBindPort == 0 {
+		// Pick a free UDP port from the registry, retry on rare kernel
+		// collision (some other process grabbed it for outbound between
+		// our reserve and our listen).
+		const maxBindRetries = 8
+		for retry := 0; retry < maxBindRetries; retry++ {
+			p, allocErr := ports.allocate(owner, protoUDP)
+			if allocErr != nil {
+				io.WriteString(session.channel, fmt.Sprintf("%s\n", allocErr))
+				return false, []byte(allocErr.Error())
+			}
+			tryAddr := net.JoinHostPort(reqPayload.BindAddr, strconv.Itoa(int(p)))
+			c, lerr := net.ListenPacket("udp", tryAddr)
+			if lerr != nil {
+				log.Printf("UDP bind retry: %s: %s", tryAddr, lerr)
+				ports.release(p, protoUDP)
+				continue
+			}
+			udpConn = c
+			requestBindPort = int(p)
+			reqPayload.BindPort = p
+			addr = tryAddr
+			break
+		}
+		if udpConn == nil {
+			msg := "could not allocate a free UDP port; range may be saturated"
+			io.WriteString(session.channel, msg+"\n")
+			return false, []byte(msg)
+		}
+	} else {
+		// Caller-specified port. Same-clientID takeover allowed; otherwise
+		// validate against the registry (range / already-in-use / per-user
+		// limit) before binding.
+		forwardsLock.Lock()
+		if existing, ok := forwards[addr]; ok {
+			if existing.clientID == clientID {
+				log.Printf("Discarding existing UDP forward for same client id %s", clientID)
+				existing.listener.Close()
+				delete(forwards, addr)
+				ports.release(uint32(requestBindPort), protoUDP)
+			} else {
+				forwardsLock.Unlock()
+				io.WriteString(session.channel, fmt.Sprintf("UDP port %d is already taken.\n", reqPayload.BindPort))
+				return false, []byte{}
+			}
+		}
+		forwardsLock.Unlock()
+
+		if rerr := ports.reserve(uint32(requestBindPort), owner, protoUDP); rerr != nil {
+			io.WriteString(session.channel, fmt.Sprintf("UDP port %d: %s\n", requestBindPort, rerr))
+			return false, []byte(rerr.Error())
+		}
+
+		udpConn, err = net.ListenPacket("udp", addr)
+		if err != nil {
+			ports.release(uint32(requestBindPort), protoUDP)
+			log.Printf("error listening for UDP address %s: %s", addr, err)
+			io.WriteString(session.channel, fmt.Sprintf("UDP listen %s: %s\n", addr, err))
+			return false, []byte(err.Error())
+		}
+	}
+
+	forwardsLock.Lock()
+	forwards[addr] = forwardsListenerData{
+		listener:  udpConn,
+		clientID:  clientID,
+		sessionID: hex.EncodeToString(conn.SessionID()),
+		conType:   UDPConnectionType,
+	}
+	forwardsLock.Unlock()
+	conn.AddForwardAddr(addr)
+
+	io.WriteString(session.channel, formatTunnelLine(fmt.Sprintf("UDP %s:%d", domainURI.Hostname(), requestBindPort), sc.localTarget))
+
+	go runUDPListener(conn, udpConn, reqPayload, addr, cancellationCtx)
+
+	return true, ssh.Marshal(&remoteForwardSuccess{uint32(requestBindPort)})
 }
 
 // runUDPListener owns the UDP socket bound for one tcpip-forward request and
