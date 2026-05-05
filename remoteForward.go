@@ -26,6 +26,13 @@ import (
 // be recognized.
 var httpBindPort uint32 = 3000
 
+// httpEnabled / tcpEnabled / udpEnabled gate which tunnel protocols are
+// accepted. Set from --http / --tcp / --udp at startup. Defaults are true so
+// tests that bypass main() see historical behavior unchanged.
+var httpEnabled = true
+var tcpEnabled = true
+var udpEnabled = true
+
 const forwardedTCPChannelType = "forwarded-tcpip"
 
 func formatTunnelLine(from, localTarget string) string {
@@ -108,6 +115,37 @@ func forwardHandler(conn *sshConnection, req *ssh.Request, execRequestCompleted 
 			headerSpecified = true
 		} else if localTargetIndex == 0 {
 			localTarget = p[localTargetIndex+len("localtarget="):]
+		}
+	}
+
+	// Default to HTTP when the client did not specify a type. Earlier behavior
+	// fell through to TCP, but HTTP is the most common case and matches what
+	// tunnel.sh sends.
+	if connectionType == "" {
+		connectionType = "http"
+	}
+
+	// Reject the request early if the operator has disabled this protocol via
+	// --http / --tcp / --udp. Surface a human-readable message on the SSH
+	// session so the client sees why their tunnel was rejected.
+	switch connectionType {
+	case "http", "https":
+		if !httpEnabled {
+			msg := "HTTP tunneling is not enabled\n"
+			io.WriteString(session.channel, msg)
+			return false, []byte(msg)
+		}
+	case "tcp":
+		if !tcpEnabled {
+			msg := "TCP tunneling is not enabled\n"
+			io.WriteString(session.channel, msg)
+			return false, []byte(msg)
+		}
+	case "udp":
+		if !udpEnabled {
+			msg := "UDP tunneling is not enabled\n"
+			io.WriteString(session.channel, msg)
+			return false, []byte(msg)
 		}
 	}
 

@@ -108,6 +108,12 @@ func main() {
 	portMaxPtr := flag.Int("portMax", 59999, "Maximum TCP/UDP remote port for tunnels (inclusive).")
 	maxPortsPerUserPtr := flag.Int("maxPortsPerUser", 30, "Maximum simultaneous TCP/UDP tunnels per authenticated key (combined across protocols).")
 
+	// --http / --tcp / --udp: per-protocol enable flags. All default to true.
+	// Disable with --http=false (Go stdlib bool flags require the `=` form).
+	httpEnabledPtr := flag.Bool("http", true, "Enable HTTP/HTTPS tunnels. Disable with --http=false.")
+	tcpEnabledPtr := flag.Bool("tcp", true, "Enable TCP tunnels. Disable with --tcp=false.")
+	udpEnabledPtr := flag.Bool("udp", true, "Enable UDP tunnels. Disable with --udp=false.")
+
 	// --genAdminHash: utility mode. Reads a passphrase from stdin, prints the
 	// bcrypt hash, and exits. Used to bootstrap the admin_passphrase_bcrypt
 	// env var without external tools.
@@ -139,6 +145,14 @@ func main() {
 		log.Fatalf("--httpPort=%d is out of range (1-65535)", *httpPortPtr)
 	}
 	httpBindPort = uint32(*httpPortPtr)
+
+	httpEnabled = *httpEnabledPtr
+	tcpEnabled = *tcpEnabledPtr
+	udpEnabled = *udpEnabledPtr
+	if !httpEnabled && !tcpEnabled && !udpEnabled {
+		log.Fatalln("at least one of --http, --tcp, --udp must be enabled")
+	}
+	log.Printf("Tunnel protocols enabled: http=%v tcp=%v udp=%v", httpEnabled, tcpEnabled, udpEnabled)
 
 	if *portMinPtr < 1 || *portMaxPtr >= 1<<16 || *portMinPtr > *portMaxPtr {
 		log.Fatalf("invalid TCP/UDP port range [%d, %d]", *portMinPtr, *portMaxPtr)

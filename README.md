@@ -55,6 +55,8 @@ The app will assign a unique subdomain for each HTTP client. For example, if you
     ./tunnel --domainUrl=https://mydomain.io --authorizedKeysFile=/etc/tunnel/authorized_keys.json
     ```
 
+    To restrict which tunnel protocols the server accepts, pass `--http=false`, `--tcp=false`, or `--udp=false`. All three default to `true`. Clients that try to open a disabled protocol get a clear error message (e.g. `UDP tunneling is not enabled`).
+
     For Docker (multi-stage build, no host Go toolchain required; the image runs as a non-root user, so HTTP defaults to 3000)
     ```
      docker build . -t=tunnel
@@ -92,7 +94,7 @@ The trailing quoted string is parsed by the server.
 
 | Field | Purpose |
 |---|---|
-| `type=` | `http`, `https`, `tcp`, or `udp`.
+| `type=` | `http`, `https`, `tcp`, or `udp`. Defaults to `http` if omitted.
 | `localTarget=` | The local `host:port` your traffic ends up at. Surfaced in server logs for debugging. |
 | `tunnelName=` | (*Optional*) Requested subdomain (HTTP/HTTPS only). Server allocates a random one if missing or already taken. |
 | `header=` | (*Optional*) Value used to rewrite `Host` and `Origin` on forwarded HTTP requests. |
