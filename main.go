@@ -363,7 +363,7 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 				s, ok := sshTunnelListeners[cacheKey]
 				if ok && s.sessionID == sessionID {
 					delete(sshTunnelListeners, cacheKey)
-					log.Printf("Purged cache for HTTP session %s\n", s.sessionID)
+					log.Debugf("Purged cache for HTTP session %s\n", s.sessionID)
 				}
 				sshTunnelListenersLock.Unlock()
 			}
@@ -382,7 +382,7 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 				delete(forwards, addr)
 				toClose = o.listener
 				conType = o.conType
-				log.Printf("Purged %s forward cache for session %s @ %s", o.conType, o.sessionID, addr)
+				log.Debugf("Purged %s forward cache for session %s @ %s", o.conType, o.sessionID, addr)
 			}
 			forwardsLock.Unlock()
 			if toClose != nil {
@@ -412,7 +412,7 @@ func handleIncomingSSHConn(nConn net.Conn, config *ssh.ServerConfig, cancellatio
 				return
 			case <-ticker.C:
 				if missing >= clientKeepaliveMaxCount {
-					log.Printf("Did not receive keepalive replies, closing session %s", hex.EncodeToString(conn.SessionID()))
+					log.Debugf("Did not receive keepalive replies, closing session %s", hex.EncodeToString(conn.SessionID()))
 					if err := conn.Close(); err != nil {
 						log.Debugf("error closing session %s: %s", hex.EncodeToString(conn.SessionID()), err)
 					}

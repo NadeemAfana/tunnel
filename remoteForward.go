@@ -285,7 +285,7 @@ func cancelForwardHandler(conn *sshConnection, req *ssh.Request, ctx context.Con
 			s, ok := sshTunnelListeners[cacheKey]
 			if ok && s.sessionID == hex.EncodeToString(conn.SessionID()) {
 				delete(sshTunnelListeners, cacheKey)
-				log.Printf("Purged cache for session %s", s.sessionID)
+				log.Debugf("Purged cache for session %s", s.sessionID)
 			}
 			sshTunnelListenersLock.Unlock()
 		}

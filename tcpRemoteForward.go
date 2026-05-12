@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -103,6 +104,9 @@ func setupTCPForward(sc *forwardSetupContext) (bool, []byte) {
 					log.Println("TCP listener: Cancellation requested")
 					return
 				default:
+				}
+				if errors.Is(err, net.ErrClosed) {
+					return
 				}
 				log.Printf("error accepting new TCP connection at %s: %s", ln.Addr(), err)
 				break

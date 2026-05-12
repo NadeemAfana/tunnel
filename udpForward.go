@@ -248,7 +248,9 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 			case <-ctx.Done():
 				log.Debugf("UDP listener cancelled for session %s @ %s", sessionID, addr)
 			default:
-				log.Debugf("UDP listener error for session %s @ %s: %s", sessionID, addr, err)
+				if !errors.Is(err, net.ErrClosed) {
+					log.Debugf("UDP listener error for session %s @ %s: %s", sessionID, addr, err)
+				}
 			}
 			closeAllFlows()
 			forwardsLock.Lock()
