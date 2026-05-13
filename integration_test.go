@@ -122,19 +122,34 @@ func setupTestServer(t *testing.T, domain string, usePath bool) *integrationTest
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Track in-flight SSH connections so cleanup can wait for them before
+	// restoring globals. Without this, a deferred releasePortFromRegistry
+	// from a connection of this test can race with the `ports = prevPorts`
+	// restore in the cleanup below, which the race detector flags.
+	var connsWG sync.WaitGroup
 	go func() {
 		for {
 			nConn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go handleIncomingSSHConn(nConn, config, ctx)
+			connsWG.Add(1)
+			go func(c net.Conn) {
+				defer connsWG.Done()
+				handleIncomingSSHConn(c, config, ctx)
+			}(nConn)
 		}
 	}()
 
 	t.Cleanup(func() {
 		cancel()
 		ln.Close()
+		// Drain in-flight handleIncomingSSHConn goroutines (including
+		// their deferred cleanups, which touch `ports`) before swapping
+		// globals back. Skipping this leaves a race window where the
+		// deferred cleanup reads `ports` after we have already restored
+		// the predecessor.
+		connsWG.Wait()
 		forwardsLock.Lock()
 		for _, l := range forwards {
 			l.listener.Close()

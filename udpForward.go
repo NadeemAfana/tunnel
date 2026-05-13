@@ -374,7 +374,21 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 				}
 				flowsMu.Unlock()
 				f.close()
-				log.Debugf("session %s: closed UDP flow %s", sessionID, k)
+				// After delete-from-map and close, the listener cannot
+				// queue any new datagrams to this inbox. Drain anything
+				// that slipped in during the close/cleanup race window
+				// so those pool buffers get returned. Safe to run
+				// alongside the sender's deferred drain; each datagram
+				// is delivered to exactly one receiver.
+				for {
+					select {
+					case d := <-f.inbox:
+						d.release()
+					default:
+						log.Debugf("session %s: closed UDP flow %s", sessionID, k)
+						return
+					}
+				}
 			}(flow, key)
 		}
 		flowsMu.Unlock()
