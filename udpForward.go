@@ -16,10 +16,13 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// UDP-specific constants. UDP datagrams can be up to 65507 bytes, so the
-// TCP-sized bufPool in remoteForward.go is too small for UDP.
+// UDP-specific constants. UDP datagrams can be up to 65507 bytes. Two pool
+// sizes split the cost. Most real UDP traffic fits in udpSmallBufSize (MTU
+// plus headroom), and only jumbo or max-size datagrams pay for the 64 kB
+// buffer.
 const (
-	udpBufferSize         = 64 << 10 // 64 kB — fits any UDP datagram (max 65507).
+	udpSmallBufSize       = 2048
+	udpLargeBufSize       = 64 << 10 // fits any UDP datagram (max 65507).
 	udpMaxDatagramSize    = 65507
 	udpFlowIdleTimeout    = 60 * time.Second
 	udpFlowReapInterval   = 15 * time.Second
@@ -27,12 +30,14 @@ const (
 	udpInboxCapacity      = 64 // per-flow datagram queue depth before drops kick in
 )
 
-var udpBufPool = sync.Pool{
-	New: func() interface{} {
-		buffer := make([]byte, udpBufferSize)
-		return &buffer
-	},
-}
+// Two pools, one per buffer size. Pool elements are pointers to fixed-size
+// arrays, NOT *[]byte. This makes returning a buffer to the wrong pool a
+// compile error: udpSmallPool.Put takes *[udpSmallBufSize]byte, and you
+// cannot pass a *[udpLargeBufSize]byte to it (and vice versa).
+var (
+	udpSmallPool = sync.Pool{New: func() any { return new([udpSmallBufSize]byte) }}
+	udpLargePool = sync.Pool{New: func() any { return new([udpLargeBufSize]byte) }}
+)
 
 // udpFlow is the per-(srcIP:srcPort) state for the channel-per-flow model.
 // Each flow owns one SSH channel, an inbox of pending datagrams to send to
@@ -41,7 +46,7 @@ var udpBufPool = sync.Pool{
 type udpFlow struct {
 	ch         ssh.Channel
 	srcAddr    net.Addr
-	inbox      chan udpDatagram
+	inbox      chan pooledDatagram
 	quit       chan struct{}
 	closeOnce  sync.Once
 	lastActive int64 // unix nano (atomic)
@@ -54,19 +59,47 @@ func (f *udpFlow) close() {
 	})
 }
 
-// udpDatagram carries a pooled buffer through the per-flow inbox. The buffer
-// is a full-sized udpBufPool slice; n is the meaningful prefix. Callers MUST
-// return the buffer with putUDPDatagram exactly once on every code path
-// (success, error, drop, drain) — otherwise the pool slowly drains.
-type udpDatagram struct {
-	bufPtr *[]byte
-	n      int
+// pooledDatagram is the sum type carried on per-flow inboxes. Concrete
+// types (smallDatagram and largeDatagram) wrap buffers from distinct pools
+// whose array-pointer element types are not assignable to each other.
+// Consumers see only .bytes() and .release(); dispatch to the correct pool
+// happens inside the concrete method. Mixing pools is structurally
+// impossible. See the udpSmallPool/udpLargePool comment above.
+type pooledDatagram interface {
+	bytes() []byte
+	release()
 }
 
-func putUDPDatagram(d udpDatagram) {
-	if d.bufPtr != nil {
-		udpBufPool.Put(d.bufPtr)
+type smallDatagram struct {
+	buf *[udpSmallBufSize]byte
+	n   int
+}
+
+func (d smallDatagram) bytes() []byte { return d.buf[:d.n] }
+func (d smallDatagram) release()      { udpSmallPool.Put(d.buf) }
+
+type largeDatagram struct {
+	buf *[udpLargeBufSize]byte
+	n   int
+}
+
+func (d largeDatagram) bytes() []byte { return d.buf[:d.n] }
+func (d largeDatagram) release()      { udpLargePool.Put(d.buf) }
+
+// acquireDatagram copies payload into a pool buffer sized for it. This is
+// the only constructor for pooledDatagram; any new code path that needs a
+// buffer for the inbox MUST go through here. The dispatch line below is
+// the one place a size/pool mismatch could be introduced. Keep it short.
+func acquireDatagram(payload []byte) pooledDatagram {
+	n := len(payload)
+	if n <= udpSmallBufSize {
+		buf := udpSmallPool.Get().(*[udpSmallBufSize]byte)
+		copy(buf[:], payload)
+		return smallDatagram{buf: buf, n: n}
 	}
+	buf := udpLargePool.Get().(*[udpLargeBufSize]byte)
+	copy(buf[:], payload)
+	return largeDatagram{buf: buf, n: n}
 }
 
 // errOversizedFrame is returned by readUDPFrame when the length prefix
@@ -113,6 +146,37 @@ func readUDPFrame(r io.Reader, buf []byte) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// readPooledDatagram reads one length-prefixed UDP frame from r and returns
+// it in a pool buffer sized for the payload. The caller MUST call .release()
+// on the returned datagram exactly once. On error the function returns nil
+// and the underlying pool buffer (if any was acquired) is already returned.
+func readPooledDatagram(r io.Reader) (pooledDatagram, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := int(binary.BigEndian.Uint16(hdr[:]))
+	if n > udpMaxDatagramSize {
+		return nil, fmt.Errorf("%w (%d bytes)", errOversizedFrame, n)
+	}
+	if n <= udpSmallBufSize {
+		buf := udpSmallPool.Get().(*[udpSmallBufSize]byte)
+		if n > 0 {
+			if _, err := io.ReadFull(r, buf[:n]); err != nil {
+				udpSmallPool.Put(buf)
+				return nil, err
+			}
+		}
+		return smallDatagram{buf: buf, n: n}, nil
+	}
+	buf := udpLargePool.Get().(*[udpLargeBufSize]byte)
+	if _, err := io.ReadFull(r, buf[:n]); err != nil {
+		udpLargePool.Put(buf)
+		return nil, err
+	}
+	return largeDatagram{buf: buf, n: n}, nil
 }
 
 // setupUDPForward binds a UDP packet listener for one tcpip-forward request.
@@ -237,9 +301,9 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 		}
 	}()
 
-	readBufPtr := udpBufPool.Get().(*[]byte)
-	defer udpBufPool.Put(readBufPtr)
-	readBuf := *readBufPtr
+	readBufArr := udpLargePool.Get().(*[udpLargeBufSize]byte)
+	defer udpLargePool.Put(readBufArr)
+	readBuf := readBufArr[:]
 
 	for {
 		n, srcAddr, err := udpConn.ReadFrom(readBuf)
@@ -269,9 +333,7 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 
 		// Acquire a pooled buffer for the datagram so the next ReadFrom can
 		// reuse readBuf without clobbering queued data.
-		dgBufPtr := udpBufPool.Get().(*[]byte)
-		copy(*dgBufPtr, readBuf[:n])
-		d := udpDatagram{bufPtr: dgBufPtr, n: n}
+		d := acquireDatagram(readBuf[:n])
 
 		key := srcAddr.String()
 		flowsMu.Lock()
@@ -279,7 +341,7 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 		if !ok {
 			if len(flows) >= udpMaxFlowsPerSession {
 				flowsMu.Unlock()
-				putUDPDatagram(d)
+				d.release()
 				log.Debugf("session %s: max UDP flows (%d) reached, dropping datagram from %s", sessionID, udpMaxFlowsPerSession, key)
 				continue
 			}
@@ -287,7 +349,7 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 			ch, openErr := openUDPFlowChannel(conn, reqPayload, srcAddr)
 			if openErr != nil {
 				flowsMu.Unlock()
-				putUDPDatagram(d)
+				d.release()
 				log.Warnf("session %s: failed to open UDP flow channel for %s: %s", sessionID, key, openErr)
 				continue
 			}
@@ -295,7 +357,7 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 			flow = &udpFlow{
 				ch:      ch,
 				srcAddr: srcAddr,
-				inbox:   make(chan udpDatagram, udpInboxCapacity),
+				inbox:   make(chan pooledDatagram, udpInboxCapacity),
 				quit:    make(chan struct{}),
 			}
 			atomic.StoreInt64(&flow.lastActive, time.Now().UnixNano())
@@ -321,9 +383,9 @@ func runUDPListener(conn *sshConnection, udpConn net.PacketConn, reqPayload *rem
 		case flow.inbox <- d:
 			atomic.StoreInt64(&flow.lastActive, time.Now().UnixNano())
 		case <-flow.quit:
-			putUDPDatagram(d)
+			d.release()
 		default:
-			putUDPDatagram(d)
+			d.release()
 			log.Debugf("session %s: UDP flow %s inbox full, dropping datagram", sessionID, key)
 		}
 	}
@@ -339,7 +401,7 @@ func udpFlowSender(f *udpFlow, sessionID, key string) {
 		for {
 			select {
 			case d := <-f.inbox:
-				putUDPDatagram(d)
+				d.release()
 			default:
 				return
 			}
@@ -351,8 +413,8 @@ func udpFlowSender(f *udpFlow, sessionID, key string) {
 		case <-f.quit:
 			return
 		case d := <-f.inbox:
-			err := writeUDPFrame(f.ch, (*d.bufPtr)[:d.n])
-			putUDPDatagram(d)
+			err := writeUDPFrame(f.ch, d.bytes())
+			d.release()
 			if err != nil {
 				log.Debugf("session %s: UDP flow %s write error: %v", sessionID, key, err)
 				f.close()
@@ -363,30 +425,30 @@ func udpFlowSender(f *udpFlow, sessionID, key string) {
 }
 
 // udpFlowReceiver reads length-prefixed frames off the SSH channel and
-// delivers each datagram back to the original UDP source.
+// delivers each datagram back to the original UDP source. Each frame is
+// read into a pool buffer sized to its payload, so the steady-state cost
+// for typical (sub-MTU) traffic is a 2 kB buffer per in-flight frame
+// rather than a persistent 64 kB buffer per flow.
 func udpFlowReceiver(f *udpFlow, udpConn net.PacketConn) {
-	bufPtr := udpBufPool.Get().(*[]byte)
-	defer udpBufPool.Put(bufPtr)
-	buf := *bufPtr
-
 	for {
-		n, err := readUDPFrame(f.ch, buf)
+		d, err := readPooledDatagram(f.ch)
 		if err != nil {
 			if errors.Is(err, errOversizedFrame) {
 				log.Warnf("UDP flow %s: %s; aborting flow", f.srcAddr, err)
 			}
 			return
 		}
-		if _, err := udpConn.WriteTo(buf[:n], f.srcAddr); err != nil {
+		if _, err := udpConn.WriteTo(d.bytes(), f.srcAddr); err != nil {
 			log.Debugf("UDP write back to %s error: %s", f.srcAddr, err)
 		}
+		d.release()
 		atomic.StoreInt64(&f.lastActive, time.Now().UnixNano())
 	}
 }
 
 // openUDPFlowChannel opens a forwarded-tcpip SSH channel for one UDP flow,
 // reusing the same channel type as TCP forwarding. The SSH client side does
-// not need to distinguish UDP from TCP at the SSH layer — `ssh -R` simply
+// not need to distinguish UDP from TCP at the SSH layer, `ssh -R` simply
 // dials the configured local bridge port for each new channel; the
 // udp-bridge helper deframes the payload there.
 func openUDPFlowChannel(conn *sshConnection, reqPayload *remoteForwardRequest, srcAddr net.Addr) (ssh.Channel, error) {
