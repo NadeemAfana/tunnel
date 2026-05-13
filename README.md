@@ -70,7 +70,7 @@ The app will assign a unique subdomain for each HTTP client. For example, if you
     Use `-p 80:3000` (or set `--httpPort=80` and run as root) if you want incoming traffic on port 80 directly without a reverse proxy.
 
 ## Client Setup
-The shell script `tunnel.sh` wraps `ssh` and adds automatic reconnection. The server only requires a standard OpenSSH client, which ships with macOS, Linux, and Windows 10 or later. Each example below shows the `tunnel.sh` invocation and the equivalent raw `ssh` command, so you can use the tool without the wrapper script.
+The shell script [tunnel.sh](tunnel.sh) wraps `ssh` and adds automatic reconnection. The server only requires a standard OpenSSH client, which ships with macOS, Linux, and Windows 10 or later. Each example below shows the [tunnel.sh](tunnel.sh) invocation and the equivalent raw `ssh` command, so you can use the tool without the wrapper script.
 
 First store the domain in a global variable (You can add this to the shell startup)
 
@@ -80,7 +80,7 @@ export TUNNEL_DOMAIN=mydomain.io
 
 Second, add the client public SSH key as a new entry in the server's authorized keys JSON file (the one passed via `--authorizedKeysFile`).
 
-### Using `ssh` directly (no `tunnel.sh` required)
+### Using `ssh` directly (no [tunnel.sh](tunnel.sh) required)
 
 The raw `ssh` commands below use these conventions so they work the same in **bash**, **zsh**, **PowerShell**, and **cmd.exe**:
 
@@ -176,7 +176,10 @@ Create a UDP tunnel at local port 5353 and remote port 5354.
 tunnel.sh udp 5353 -p 5354
 ```
 
-UDP requires the `udp-bridge` helper because SSH only forwards TCP. `tunnel.sh` starts the bridge automatically. If you invoke `ssh` directly, run the bridge yourself in a separate terminal, then forward its TCP listen port:
+> [!NOTE]
+> UDP requires the `udp-bridge` helper because SSH only forwards TCP. [tunnel.sh](tunnel.sh) starts the bridge automatically.
+
+ If you invoke `ssh` directly, run the bridge yourself in a separate terminal, then forward its TCP listen port:
 ```
 # Terminal 1: start the bridge listening on a fixed TCP port (here 7777)
 udp-bridge --bridge=127.0.0.1:7777 --target=localhost:5353
@@ -222,7 +225,7 @@ On Windows, use the full path (e.g. `C:\Users\username\.ssh\id_ed25519_tunnel`).
 
 ### Reclaiming the same subdomain after reconnect (raw `ssh`)
 
-`tunnel.sh` automatically generates an `id=` per run so that when the connection drops and the wrapper reconnects, the server recognizes the returning client and hands back the same `tunnelName`. If you script `ssh` yourself, you must supply a stable `id=` value of your own. Pick any long random string and reuse it across reconnects:
+[tunnel.sh](tunnel.sh) automatically generates an `id=` per run so that when the connection drops and the wrapper reconnects, the server recognizes the returning client and hands back the same `tunnelName`. If you script `ssh` yourself, you must supply a stable `id=` value of your own. Pick any long random string and reuse it across reconnects:
 ```
 # bash / zsh
 TUNNEL_ID=$(uuidgen)
@@ -260,7 +263,7 @@ Specify a non-default identity file with `-k`:
 tunnel.sh admin list -k ~/.ssh/admin_id_ed25519
 ```
 
-### Raw `ssh` admin commands (no `tunnel.sh`)
+### Raw `ssh` admin commands (no [tunnel.sh](tunnel.sh))
 
 Admin requests use a tiny stdin protocol that any OpenSSH client can drive:
 
@@ -312,7 +315,8 @@ Two safety rails are enforced:
 - A key cannot remove itself (would lock the caller out).
 - Names and public keys must be unique - adding a duplicate is rejected.
 
-UDP mode requires a small helper binary (`udp-bridge`) on the client. By default `tunnel.sh` looks for it at `$HOME/.tunnel/udp-bridge` (`.exe` on Windows). To enable auto-download, set `TUNNEL_BRIDGE_URL` with `{os}` / `{arch}` placeholders pointing at your release assets:
+> [!NOTE]
+> UDP mode requires a small helper binary (`udp-bridge`) on the client. By default [tunnel.sh](tunnel.sh) looks for it at `$HOME/.tunnel/udp-bridge` (`.exe` on Windows). To enable auto-download, set `TUNNEL_BRIDGE_URL` with `{os}` / `{arch}` placeholders pointing at your release assets:
 
 ```
 export TUNNEL_BRIDGE_URL='https://github.com/owner/repo/releases/latest/download/udp-bridge-{os}-{arch}'
