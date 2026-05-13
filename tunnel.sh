@@ -322,8 +322,101 @@ detect_os_arch () {
   esac
 }
 
+bridge_download_url () {
+  # Substitute {os}/{arch} into $TUNNEL_BRIDGE_URL; append .exe for Windows.
+  local u="${TUNNEL_BRIDGE_URL//\{os\}/$os}"
+  u="${u//\{arch\}/$arch}"
+  [[ "$os" == "windows" ]] && u="${u}.exe"
+  printf '%s' "$u"
+}
+
+download_bridge_binary () {
+  # Downloads the asset for the current $os/$arch into $bridge_bin.
+  # Caller handles any user prompt; this function only fetches.
+  local url
+  url=$(bridge_download_url)
+  mkdir -p "$(dirname "$bridge_bin")"
+  if ! curl -fSL "$url" -o "$bridge_bin"; then
+    echo "Download from $url failed."
+    rm -f "$bridge_bin"
+    return 1
+  fi
+  chmod +x "$bridge_bin"
+}
+
+# State file format ($HOME/.tunnel/version-check):
+#   last_check_date=YYYY-MM-DD   # gates GitHub to once per day
+#   declined_version=X.Y.Z       # sticky: never re-prompt for this exact version
+check_for_bridge_update () {
+  # Only inspect GitHub releases URLs. Custom mirrors are out of scope.
+  [[ "$TUNNEL_BRIDGE_URL" =~ ^(https://github\.com/[^/]+/[^/]+)/releases/latest/download/ ]] || return 0
+  local repo_base="${BASH_REMATCH[1]}"
+
+  local state_file="$HOME/.tunnel/version-check"
+  local today
+  today=$(date +%Y-%m-%d)
+  local last_check_date="" declined_version=""
+  if [[ -f "$state_file" ]]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        last_check_date)  last_check_date="$value" ;;
+        declined_version) declined_version="$value" ;;
+      esac
+    done < "$state_file"
+  fi
+
+  # Already checked today: do not re-prompt or re-hit the network.
+  [[ "$last_check_date" == "$today" ]] && return 0
+
+  # Chase the redirect on releases/latest to learn the published tag without
+  # downloading the binary. -I uses HEAD, -L follows redirects, -f fails on 4xx/5xx.
+  local effective_url
+  effective_url=$(curl -sfLI -o /dev/null -w '%{url_effective}' "$repo_base/releases/latest" 2>/dev/null) || return 0
+  [[ "$effective_url" =~ /releases/tag/(.+)$ ]] || return 0
+  local latest_version="${BASH_REMATCH[1]#v}"
+  latest_version="${latest_version%$'\r'}"
+
+  write_version_state () {
+    mkdir -p "$(dirname "$state_file")"
+    {
+      printf "last_check_date=%s\n" "$today"
+      [[ -n "$declined_version" ]] && printf "declined_version=%s\n" "$declined_version"
+    } > "$state_file"
+  }
+
+  # Mark today checked so a transient YES/NO/network state doesn't cause repeat prompts.
+  write_version_state
+
+  local installed_version
+  installed_version=$("$bridge_bin" --version 2>/dev/null | awk '{print $2}')
+  [[ -z "$installed_version" ]] && return 0
+  installed_version="${installed_version#v}"
+
+  # No prompt if not newer, or user already declined this exact version.
+  [[ "$latest_version" == "$installed_version" ]] && return 0
+  [[ "$latest_version" == "$declined_version"  ]] && return 0
+  local newer
+  newer=$(printf '%s\n%s\n' "$latest_version" "$installed_version" | sort -V | tail -n1)
+  [[ "$newer" == "$latest_version" ]] || return 0
+
+  echo "A newer udp-bridge is available: $latest_version (you have $installed_version)."
+  read -p "Download the update now? [y/N] " ans
+  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+    declined_version="$latest_version"
+    write_version_state
+    return 0
+  fi
+
+  if ! download_bridge_binary; then
+    return 0
+  fi
+  declined_version=""
+  write_version_state
+  echo "Updated udp-bridge to $latest_version at $bridge_bin"
+}
+
 resolve_bridge_binary () {
-  # Explicit override wins.
+  # Explicit override wins. User is managing their own binary; do not touch it.
   if [[ -n "${UDP_BRIDGE_BIN:-}" ]]; then
     if [[ ! -x "$UDP_BRIDGE_BIN" ]]; then
       echo "UDP_BRIDGE_BIN=$UDP_BRIDGE_BIN is not an executable file."
@@ -340,6 +433,7 @@ resolve_bridge_binary () {
   [[ "$os" == "windows" ]] && bridge_bin="${bridge_bin}.exe"
 
   if [[ -x "$bridge_bin" ]]; then
+    check_for_bridge_update
     return
   fi
 
@@ -352,11 +446,8 @@ resolve_bridge_binary () {
     exit 1
   fi
 
-  # Substitute {os} / {arch}; append .exe for Windows assets.
-  local url="${TUNNEL_BRIDGE_URL//\{os\}/$os}"
-  url="${url//\{arch\}/$arch}"
-  [[ "$os" == "windows" ]] && url="${url}.exe"
-
+  local url
+  url=$(bridge_download_url)
   echo "udp-bridge not found at $bridge_bin"
   read -p "Download $os/$arch build from $url ? [y/N] " ans
   if [[ ! "$ans" =~ ^[Yy]$ ]]; then
@@ -364,13 +455,9 @@ resolve_bridge_binary () {
     exit 1
   fi
 
-  mkdir -p "$(dirname "$bridge_bin")"
-  if ! curl -fSL "$url" -o "$bridge_bin"; then
-    echo "Download from $url failed."
-    rm -f "$bridge_bin"
+  if ! download_bridge_binary; then
     exit 1
   fi
-  chmod +x "$bridge_bin"
   echo "Cached udp-bridge at $bridge_bin"
 }
 
