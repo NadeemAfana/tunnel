@@ -605,8 +605,11 @@ done) > $fifo &
 child=$!
 
 # Read output from SSH using the pipe one line at a time. The server
-# sends fully-formatted lines, so we just echo.
-stdbuf -oL head $fifo -n $((10**10)) | grep --line-buffered '.*' |
+# sends fully-formatted lines, so we just echo. `cat` blocks on the FIFO as
+# an external process so SIGINT (Ctrl+C) terminates it directly and the main
+# shell's cleanup trap runs; doing the blocking `read` in the main shell
+# instead would defer the trap until the next line arrived.
+cat "$fifo" |
   while IFS= read -r LINE0
   do
     printf '%s\n' "${LINE0}"
