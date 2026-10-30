@@ -588,10 +588,20 @@ trap cleanup EXIT SIGINT SIGTERM
 # error, so signal the parent to exit. $SECONDS is portable to bash 3.2
 # (macOS default) and immune to wall-clock changes.
 fastFailSeconds=5
-(while :; do
+# This subshell is an async job, so bash starts it (and ssh) with SIGINT
+# ignored: Ctrl+C never reaches ssh. cleanup() SIGTERMs the subshell, and the
+# trap forwards that to ssh. Without it ssh is orphaned, stays connected, and
+# keeps holding tunnelName, so the next run gets "already taken". ssh runs in
+# the background with `wait` because bash defers traps until a foreground
+# child exits, but `wait` returns as soon as a trapped signal arrives.
+(trap 'kill $sshPid 2>/dev/null; exit 0' TERM
+while :; do
   startedAt=$SECONDS
-  ssh -o 'PubkeyAcceptedKeyTypes +ssh-rsa' -n -p $sshPort $sshCliArgs -R "*:$remotePort:$localHostPort" $USER@$TUNNEL_DOMAIN "$sshServerArgs" 2>&1
+  ssh -o 'PubkeyAcceptedKeyTypes +ssh-rsa' -n -p $sshPort $sshCliArgs -R "*:$remotePort:$localHostPort" $USER@$TUNNEL_DOMAIN "$sshServerArgs" 2>&1 &
+  sshPid=$!
+  wait $sshPid
   rc=$?
+  sshPid=
   if [[ $rc -eq 0 ]]; then
     break
   fi
